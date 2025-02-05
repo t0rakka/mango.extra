@@ -237,15 +237,10 @@ int main(int argc, const char* argv[])
     test_qoi_tile("qoi+tile: ", bitmap);
     test_zstd    ("zstd:     ", bitmap);
     test_lz4     ("lz4:      ", bitmap);
-
-    printf("----------------------------------------------\n");
-    printf("mango codecs\n");
-    printf("----------------------------------------------\n");
     test_format  ("png:      ", bitmap, ".png", true);
     test_format  ("zpng:     ", bitmap, ".zpng", true);
     test_format  ("jpg:      ", bitmap, ".jpg", false);
     test_format  ("webp:     ", bitmap, ".webp", false);
     test_format  ("qoi:      ", bitmap, ".qoi", true);
     test_format  ("toi:      ", bitmap, ".toi", true);
-
 }
