@@ -48,7 +48,7 @@ if (NOT WIN32)
 endif ()
 
 find_package(mango REQUIRED)
-target_link_libraries(qoitest PUBLIC mango)
+target_link_libraries(qoitest PUBLIC mango::mango)
 
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
