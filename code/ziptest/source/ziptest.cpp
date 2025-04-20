@@ -30,7 +30,9 @@ int main()
     test("../data/lzma.zip", "mipsIV32.pdf", "", 0x69dc3b95);
     test("../data/ppmd.zip", "mipsIV32.pdf", "", 0x69dc3b95);
     test("../data/bzip2_crypto.zip", "station.jpg", "rapa1234", 0xafce3b8d);
-    // TODO: not supported
-    //test("../data/bzip2_aes256.zip", "station.jpg", "rapa1234", 0xafce3b8d);
-    //test("../data/deflate64.zip", "mipsIV32.pdf", "", 0x69dc3b95);
+    test("../data/bzip2_aes256.zip", "station.jpg", "rapa1234", 0xafce3b8d);
+    test("../data/aes128.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
+    test("../data/aes192.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
+    test("../data/aes256.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
+    //test("../data/deflate64.zip", "mipsIV32.pdf", "", 0x69dc3b95); // TODO: not supported
 }
