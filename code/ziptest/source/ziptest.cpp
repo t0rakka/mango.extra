@@ -34,5 +34,5 @@ int main()
     test("../data/aes128.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
     test("../data/aes192.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
     test("../data/aes256.zip", "mipsIV32.pdf", "secret1234", 0x69dc3b95);
-    //test("../data/deflate64.zip", "mipsIV32.pdf", "", 0x69dc3b95); // TODO: not supported
+    test("../data/deflate64.zip", "mipsIV32.pdf", "", 0x69dc3b95);
 }
