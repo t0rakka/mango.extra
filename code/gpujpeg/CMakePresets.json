@@ -1,0 +1,36 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 19 },
+    "configurePresets": [
+        {
+            "name": "ninja",
+            "description": "Ninja Release (system / local mango)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "vcpkg-ninja",
+            "description": "Ninja Release with vcpkg toolchain (requires VCPKG_ROOT)",
+            "inherits": ["ninja"],
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_INSTALL_OPTIONS": "--no-print-usage"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ninja",
+            "configurePreset": "ninja",
+            "jobs": 0
+        },
+        {
+            "name": "vcpkg-ninja",
+            "configurePreset": "vcpkg-ninja",
+            "jobs": 0
+        }
+    ]
+}
