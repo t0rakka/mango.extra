@@ -1,0 +1,18 @@
+
+-------------------------------------------------------------------------------------------
+
+OS: Linux Mint
+Kernel: 6.8.0-149
+Compiler: G++ 14.2.0
+
+CPU: AMD TR 3990 (64 cores, 128 threads)
+GPU: nVidia GTX 2080ti
+
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    36.34ms    4.18ms   11.97ms    6.85ms   43.19ms  host->VkImage
+mango-hybrid             20.51ms   16.07ms    4.44ms    0.36ms   31.34ms  file->VkImage
+nvjpeg-hybrid            40.32ms   36.11ms    4.21ms    0.33ms   40.65ms  file->VkImage
+nvjpeg-gpu               42.85ms   40.29ms    2.56ms    0.32ms   43.17ms  file->VkImage
+
+-------------------------------------------------------------------------------------------
