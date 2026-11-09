@@ -32,3 +32,18 @@ nvjpeg-hybrid            11.09ms    8.77ms    2.31ms    0.21ms   11.30ms  file->
 nvjpeg-gpu                9.81ms    8.80ms    1.01ms    0.17ms    9.98ms  file->VkImage
 
 -------------------------------------------------------------------------------------------
+
+OS: Linux Arch
+Kernel: 7.2.14
+Compiler: G++ 16.2.1
+
+CPU: AMD Ryzen9 9950X3D (16 cores: 32 threads)
+GPU: AMD Radeon 9070 XT
+
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    10.88ms    3.13ms    5.80ms    1.36ms   12.24ms  host->VkImage
+mango-hybrid              7.95ms    1.62ms    6.32ms    0.21ms   16.80ms  file->VkImage
+roc-hardware             96.59ms   93.86ms    2.72ms    0.16ms   96.76ms  file->VkImage
+
+-------------------------------------------------------------------------------------------
