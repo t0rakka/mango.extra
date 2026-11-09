@@ -352,9 +352,9 @@ void MangoHybridCompute::destroy()
     if (m_graphics_thread.joinable())
         m_graphics_thread.join();
     freeFrameResources();
-    m_plan.clear();
-    m_segment_ready.reset();
-    m_segment_ready_count = 0;
+    m_pending.clear();
+    m_row_covered.clear();
+    m_rows_covered = 0;
 
     if (!m_device)
         return;
@@ -412,9 +412,9 @@ void MangoHybridCompute::freeFrameResources()
 {
     if (!m_device)
     {
-        m_plan.clear();
-        m_segment_ready.reset();
-        m_segment_ready_count = 0;
+        m_pending.clear();
+        m_row_covered.clear();
+        m_rows_covered = 0;
         m_segment_gpu.clear();
         return;
     }
@@ -448,16 +448,6 @@ void MangoHybridCompute::freeFrameResources()
         m_allocator->destroyBuffer(m_frame_staging);
     m_frame_staging = {};
     m_frame_samples = 0;
-}
-
-int MangoHybridCompute::findSegment(int mcu_y0) const
-{
-    for (size_t i = 0; i < m_plan.size(); ++i)
-    {
-        if (m_plan[i].mcu_y0 == mcu_y0)
-            return int(i);
-    }
-    return -1;
 }
 
 bool MangoHybridCompute::createPipeline(std::string& error)
@@ -615,7 +605,8 @@ bool MangoHybridCompute::allocFrameResources(std::string& error)
     if (m_host_coeffs.size() != m_frame_samples)
         m_host_coeffs.resize(m_frame_samples);
 
-    const uint32_t n = uint32_t(m_plan.size());
+    // One slot per MCU row: serial JPEGs emit short strips, Mango1 emits wider ones.
+    const uint32_t n = uint32_t(std::max(m_info.ymcu, 1));
     VkDescriptorPoolSize sizes[2] =
     {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, n },
@@ -654,8 +645,8 @@ bool MangoHybridCompute::allocFrameResources(std::string& error)
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
 
-    m_segment_gpu.resize(m_plan.size());
-    std::vector<VkDescriptorSetLayout> layouts(m_plan.size(), m_set_layout);
+    m_segment_gpu.resize(n);
+    std::vector<VkDescriptorSetLayout> layouts(n, m_set_layout);
     VkDescriptorSetAllocateInfo set_alloc =
     {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -725,32 +716,14 @@ bool MangoHybridCompute::startFrame(const JpegInfo& info, int hardware_threads, 
     m_gpu_error = false;
     m_gpu_error_msg.clear();
 
-    const size_t row_strip = hybridSegmentRowsPerTask(info.ymcu, hardware_threads);
-    const size_t coeffs_per_row = size_t(info.xmcu) * size_t(info.blocks_in_mcu) * 64;
-
-    m_plan.clear();
-    for (int y0 = 0; y0 < info.ymcu; )
-    {
-        const int y1 = std::min(y0 + int(row_strip), info.ymcu);
-        SegmentPlan p;
-        p.mcu_y0 = y0;
-        p.mcu_y1 = y1;
-        p.coeff_offset = size_t(y0) * coeffs_per_row;
-        p.samples = size_t(y1 - y0) * coeffs_per_row;
-        m_plan.push_back(p);
-        y0 = y1;
-    }
-
-    m_segment_ready_count = m_plan.size();
-    m_segment_ready = std::make_unique<std::atomic<bool>[]>(m_segment_ready_count);
-    for (size_t i = 0; i < m_segment_ready_count; ++i)
-        m_segment_ready[i] = false;
+    (void)hardware_threads;
+    m_pending.clear();
+    m_row_covered.assign(size_t(std::max(info.ymcu, 0)), 0);
+    m_rows_covered = 0;
 
     if (!allocFrameResources(error))
         return false;
     if (!recordPrepare(error))
-        return false;
-    if (!recordSegmentCommands(error))
         return false;
 
     vkResetFences(m_device, 1, &m_prepare_fence);
@@ -788,30 +761,50 @@ bool MangoHybridCompute::handoffBand(const CoeffView& view, std::string& error)
         return false;
     }
 
-    const int idx = findSegment(view.mcu_y0);
-    if (idx < 0)
+    const int y0 = view.mcu_y0;
+    const int y1 = view.mcu_y1;
+    const int rows = y1 - y0;
+    const size_t stride = size_t(m_info.xmcu) * size_t(m_info.blocks_in_mcu) * 64;
+    if (rows <= 0 || y0 < 0 || y1 > m_info.ymcu)
     {
-        error = fmt::format("unexpected MCU band y0={}", view.mcu_y0);
+        error = fmt::format("coefficient band rows {}..{} outside 0..{}", y0, y1, m_info.ymcu);
         return false;
     }
-    SegmentPlan& plan = m_plan[size_t(idx)];
-    if (plan.samples != view.samples)
+    if (view.samples != size_t(rows) * stride)
     {
-        error = fmt::format("segment {} sample mismatch", idx);
+        error = fmt::format("band y0={} sample mismatch", y0);
         return false;
     }
 
-    // Workers only publish. The graphics thread copies this range after the
-    // release, so this thread never stores into the upload mapping and never
-    // waits on a queue submit.
-    const s16* expected = m_host_coeffs.data() + plan.coeff_offset;
+    const s16* expected = m_host_coeffs.data() + size_t(y0) * stride;
     if (view.data != expected)
     {
-        error = fmt::format("segment {} is outside host coefficient storage", idx);
+        error = fmt::format("band y0={} is outside host coefficient storage", y0);
         return false;
     }
 
-    m_segment_ready[idx].store(true, std::memory_order_release);
+    SegmentPlan plan;
+    plan.mcu_y0 = y0;
+    plan.mcu_y1 = y1;
+    plan.coeff_offset = size_t(y0) * stride;
+    plan.samples = view.samples;
+
+    {
+        std::lock_guard<std::mutex> lock(m_gpu_mutex);
+        for (int y = y0; y < y1; ++y)
+        {
+            if (m_row_covered[size_t(y)])
+            {
+                error = fmt::format("MCU row {} published twice", y);
+                return false;
+            }
+        }
+        for (int y = y0; y < y1; ++y)
+            m_row_covered[size_t(y)] = 1;
+        m_rows_covered += rows;
+        m_pending.push_back(plan);
+    }
+
     m_handoffs.fetch_add(1, std::memory_order_relaxed);
     m_gpu_cv.notify_one();
     return true;
@@ -852,30 +845,24 @@ bool MangoHybridCompute::recordPrepare(std::string& /*error*/)
     return true;
 }
 
-bool MangoHybridCompute::recordSegmentCommands(std::string& /*error*/)
+bool MangoHybridCompute::recordBandCommand(const SegmentPlan& plan, SegmentGpu& gpu, std::string& /*error*/)
 {
-    for (size_t index = 0; index < m_plan.size(); ++index)
+    vkResetCommandBuffer(gpu.cmd, 0);
+    VkCommandBufferBeginInfo begin =
     {
-        const SegmentPlan& plan = m_plan[index];
-        SegmentGpu& gpu = m_segment_gpu[index];
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(gpu.cmd, &begin);
 
-        vkResetCommandBuffer(gpu.cmd, 0);
-        VkCommandBufferBeginInfo begin =
-        {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        };
-        vkBeginCommandBuffer(gpu.cmd, &begin);
-
-        const int rows = plan.mcu_y1 - plan.mcu_y0;
-        PushConstants pc = makePush(m_info, plan.mcu_y0, rows);
-        vkCmdBindPipeline(gpu.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
-        vkCmdBindDescriptorSets(gpu.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            m_pipeline_layout, 0, 1, &gpu.desc_set, 0, nullptr);
-        vkCmdPushConstants(gpu.cmd, m_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(gpu.cmd, uint32_t(rows * m_info.xmcu), 1, 1);
-        vkEndCommandBuffer(gpu.cmd);
-    }
+    const int rows = plan.mcu_y1 - plan.mcu_y0;
+    PushConstants pc = makePush(m_info, plan.mcu_y0, rows);
+    vkCmdBindPipeline(gpu.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
+    vkCmdBindDescriptorSets(gpu.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        m_pipeline_layout, 0, 1, &gpu.desc_set, 0, nullptr);
+    vkCmdPushConstants(gpu.cmd, m_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(gpu.cmd, uint32_t(rows * m_info.xmcu), 1, 1);
+    vkEndCommandBuffer(gpu.cmd);
     return true;
 }
 
@@ -896,50 +883,53 @@ void MangoHybridCompute::graphicsThreadMain()
     }
     m_frame_gpu_started = true;
 
-    const int total = int(m_plan.size());
-    std::vector<bool> submitted(size_t(total), false);
-    int submit_count = 0;
+    const int total_rows = m_info.ymcu;
+    int submitted_rows = 0;
+    int slot = 0;
+    std::vector<int> submitted_slots;
 
-    auto any_ready_unsubmitted = [&]() -> bool
+    while (submitted_rows < total_rows)
     {
-        for (int i = 0; i < total; ++i)
-        {
-            if (!submitted[size_t(i)] && m_segment_ready[i].load(std::memory_order_acquire))
-                return true;
-        }
-        return false;
-    };
-
-    while (submit_count < total)
-    {
+        std::vector<SegmentPlan> batch;
         {
             std::unique_lock<std::mutex> lock(m_gpu_mutex);
             m_gpu_cv.wait(lock, [&]
             {
                 if (m_gpu_error.load())
                     return true;
-                if (any_ready_unsubmitted())
+                if (!m_pending.empty())
                     return true;
                 return m_huffman_done.load();
             });
+            batch.swap(m_pending);
         }
 
         if (m_gpu_error.load())
             return;
 
-        bool progressed = false;
-        for (int i = 0; i < total; ++i)
-        {
-            if (submitted[size_t(i)])
-                continue;
-            if (!m_segment_ready[i].load(std::memory_order_acquire))
-                continue;
+        if (batch.empty())
+            break;
 
-            const SegmentPlan& plan = m_plan[size_t(i)];
+        for (const SegmentPlan& plan : batch)
+        {
+            if (slot >= int(m_segment_gpu.size()))
+            {
+                m_gpu_error_msg = "more coefficient bands than MCU rows";
+                m_gpu_error = true;
+                m_gpu_cv.notify_all();
+                return;
+            }
+            std::string rec_err;
+            if (!recordBandCommand(plan, m_segment_gpu[size_t(slot)], rec_err))
+            {
+                m_gpu_error_msg = rec_err;
+                m_gpu_error = true;
+                m_gpu_cv.notify_all();
+                return;
+            }
+
             const VkDeviceSize off = VkDeviceSize(plan.coeff_offset) * sizeof(s16);
             const VkDeviceSize bytes = VkDeviceSize(plan.samples) * sizeof(s16);
-            // One streaming copy of a finished, private range. Upload memory
-            // (write-combined / ReBAR) is for this, not for Huffman stores.
             std::memcpy(reinterpret_cast<s16*>(m_frame_staging.mapped) + plan.coeff_offset,
                 m_host_coeffs.data() + plan.coeff_offset, size_t(bytes));
             m_allocator->flush(m_frame_staging.allocation, off, bytes);
@@ -948,36 +938,30 @@ void MangoHybridCompute::graphicsThreadMain()
             {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .commandBufferCount = 1,
-                .pCommandBuffers = &m_segment_gpu[size_t(i)].cmd,
+                .pCommandBuffers = &m_segment_gpu[size_t(slot)].cmd,
             };
-            if (vkQueueSubmit(m_queue, 1, &submit, m_segment_gpu[size_t(i)].fence) != VK_SUCCESS)
+            if (vkQueueSubmit(m_queue, 1, &submit, m_segment_gpu[size_t(slot)].fence) != VK_SUCCESS)
             {
                 m_gpu_error_msg = "vkQueueSubmit failed";
                 m_gpu_error = true;
                 m_gpu_cv.notify_all();
                 return;
             }
-            submitted[size_t(i)] = true;
-            ++submit_count;
-            progressed = true;
+            submitted_slots.push_back(slot);
+            submitted_rows += plan.mcu_y1 - plan.mcu_y0;
+            ++slot;
         }
-
-        if (!progressed && m_huffman_done.load())
-            break;
     }
 
     std::string err;
-    if (submit_count < total)
-        err = "missing coefficient segment(s) before GPU dispatch";
-    else if (submit_count > 0)
+    if (submitted_rows != total_rows)
+        err = "missing coefficient rows before GPU dispatch";
+    else if (!submitted_slots.empty())
     {
         std::vector<VkFence> fences;
-        fences.reserve(size_t(submit_count));
-        for (int i = 0; i < total; ++i)
-        {
-            if (submitted[size_t(i)])
-                fences.push_back(m_segment_gpu[size_t(i)].fence);
-        }
+        fences.reserve(submitted_slots.size());
+        for (int s : submitted_slots)
+            fences.push_back(m_segment_gpu[size_t(s)].fence);
         const u64 t0 = nowUs();
         if (vkWaitForFences(m_device, uint32_t(fences.size()), fences.data(), VK_TRUE, UINT64_MAX) != VK_SUCCESS)
             err = "compute fence failed";
@@ -1004,11 +988,6 @@ void MangoHybridCompute::graphicsThreadMain()
             }
         }
     }
-    else if (submit_count == 0)
-    {
-        // Huffman produced nothing to shade; still mark done.
-    }
-
     if (!err.empty())
     {
         m_gpu_error_msg = err;

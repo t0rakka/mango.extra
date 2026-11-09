@@ -88,10 +88,9 @@ private:
     void freeFrameResources();
     void graphicsThreadMain();
     bool recordPrepare(std::string& error);
-    bool recordSegmentCommands(std::string& error);
+    bool recordBandCommand(const SegmentPlan& plan, SegmentGpu& gpu, std::string& error);
     bool recordLayoutToSampleReady(std::string& error);
     void addGpuWaitUs(mango::u64 us);
-    int findSegment(int mcu_y0) const;
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
@@ -117,9 +116,11 @@ private:
     std::vector<mango::s16> m_host_coeffs;
     size_t m_frame_samples = 0;
 
-    std::vector<SegmentPlan> m_plan;
-    std::unique_ptr<std::atomic<bool>[]> m_segment_ready;
-    size_t m_segment_ready_count = 0;
+    // Bands are whatever decodeCoefficients publishes (8-row serial strips,
+    // restart strips, or Mango1 tasks). Offsets stay y0 * coeffs_per_row.
+    std::vector<SegmentPlan> m_pending;
+    std::vector<uint8_t> m_row_covered;
+    int m_rows_covered = 0;
     std::vector<SegmentGpu> m_segment_gpu;
     std::atomic<int> m_handoffs { 0 };
 
