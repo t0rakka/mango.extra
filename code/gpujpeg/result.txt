@@ -10,9 +10,9 @@ GPU: nVidia GTX 2080ti
 
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    36.34ms    4.18ms   11.97ms    6.85ms   43.19ms  host->VkImage
-mango-hybrid             20.51ms   16.07ms    4.44ms    0.36ms   31.34ms  file->VkImage
-nvjpeg-hybrid            40.32ms   36.11ms    4.21ms    0.33ms   40.65ms  file->VkImage
-nvjpeg-gpu               42.85ms   40.29ms    2.56ms    0.32ms   43.17ms  file->VkImage
+mango                    35.26ms    4.02ms   12.14ms    7.34ms   42.61ms  host->VkImage
+mango-hybrid             15.95ms    3.88ms   12.07ms    0.37ms   55.86ms  file->VkImage
+nvjpeg-hybrid            44.95ms   39.89ms    5.06ms    0.35ms   45.31ms  file->VkImage
+nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->VkImage
 
 -------------------------------------------------------------------------------------------
