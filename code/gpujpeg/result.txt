@@ -5,7 +5,7 @@ OS: Linux Mint
 Kernel: 6.8.0-149
 Compiler: G++ 14.2.0
 
-CPU: AMD TR 3990 (64 cores, 128 threads)
+CPU: AMD TR 3990 (64 cores: 128 threads)
 GPU: nVidia GTX 2080ti
 
 backend                    READY    decode   promote   present       e2e  path
@@ -14,5 +14,21 @@ mango                    35.26ms    4.02ms   12.14ms    7.34ms   42.61ms  host->
 mango-hybrid             15.95ms    3.88ms   12.07ms    0.37ms   55.86ms  file->VkImage
 nvjpeg-hybrid            44.95ms   39.89ms    5.06ms    0.35ms   45.31ms  file->VkImage
 nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->VkImage
+
+-------------------------------------------------------------------------------------------
+
+OS: Windows 11
+Version: 26H2
+Compiler: Visual Studio 18.6.1
+
+CPU: Intel i9-13900K (8 P-cores, 16 E-cores: 32 threads)
+GPU: nVidia RTX 4090
+
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    15.66ms    3.36ms    5.34ms    4.14ms   19.80ms  host->VkImage
+mango-hybrid              7.98ms    1.70ms    6.28ms    0.41ms   23.17ms  file->VkImage
+nvjpeg-hybrid            11.09ms    8.77ms    2.31ms    0.21ms   11.30ms  file->VkImage
+nvjpeg-gpu                9.81ms    8.80ms    1.01ms    0.17ms    9.98ms  file->VkImage
 
 -------------------------------------------------------------------------------------------
