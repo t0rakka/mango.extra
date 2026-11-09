@@ -47,3 +47,19 @@ mango-hybrid              7.95ms    1.62ms    6.32ms    0.21ms   16.80ms  file->
 roc-hardware             96.59ms   93.86ms    2.72ms    0.16ms   96.76ms  file->VkImage
 
 -------------------------------------------------------------------------------------------
+
+OS: macOS Golden Gate
+Version: 27.0.1
+Compiler: Apple clang 21.0.0 (clang-2100.3.34.2)
+
+CPU: Apple M4 (12 Performance, 4 Efficiency: 16 threads)
+GPU: Apple M4 Max (40 cores)
+
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    19.92ms    3.77ms   13.84ms    8.02ms   27.94ms  host->VkImage
+mango-hybrid             17.95ms    2.34ms   15.61ms    1.09ms   23.05ms  file->VkImage
+apple-vt [hw]            14.02ms   13.93ms    0.09ms    1.25ms   15.29ms  file->VkImage
+apple-imageio            37.70ms   37.61ms    0.09ms    1.09ms   38.81ms  file->VkImage
+
+-------------------------------------------------------------------------------------------
