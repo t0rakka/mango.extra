@@ -610,6 +610,11 @@ bool MangoHybridCompute::allocFrameResources(std::string& error)
         return false;
     }
 
+    // Grow only. resize() value-initializes, and the entropy loop already zeros
+    // each MCU. Do not wipe the buffer on every frame.
+    if (m_host_coeffs.size() != m_frame_samples)
+        m_host_coeffs.resize(m_frame_samples);
+
     const uint32_t n = uint32_t(m_plan.size());
     VkDescriptorPoolSize sizes[2] =
     {
@@ -765,14 +770,14 @@ bool MangoHybridCompute::startFrame(const JpegInfo& info, int hardware_threads, 
     return true;
 }
 
-mango::s16* MangoHybridCompute::coeffStorage() const
+mango::s16* MangoHybridCompute::coeffStorage()
 {
-    return m_frame_staging.mapped ? reinterpret_cast<s16*>(m_frame_staging.mapped) : nullptr;
+    return m_host_coeffs.empty() ? nullptr : m_host_coeffs.data();
 }
 
 bool MangoHybridCompute::handoffBand(const CoeffView& view, std::string& error)
 {
-    if (!view.data || !m_frame_staging.mapped)
+    if (!view.data || m_host_coeffs.empty() || !m_frame_staging.mapped)
     {
         error = "hybrid frame not started";
         return false;
@@ -796,10 +801,15 @@ bool MangoHybridCompute::handoffBand(const CoeffView& view, std::string& error)
         return false;
     }
 
-    auto* dest = reinterpret_cast<s16*>(m_frame_staging.mapped) + plan.coeff_offset;
-    // setCoeffStorage() writes this range in place. Any other pointer is copied.
-    if (view.data != dest)
-        std::memcpy(dest, view.data, view.samples * sizeof(s16));
+    // Workers only publish. The graphics thread copies this range after the
+    // release, so this thread never stores into the upload mapping and never
+    // waits on a queue submit.
+    const s16* expected = m_host_coeffs.data() + plan.coeff_offset;
+    if (view.data != expected)
+    {
+        error = fmt::format("segment {} is outside host coefficient storage", idx);
+        return false;
+    }
 
     m_segment_ready[idx].store(true, std::memory_order_release);
     m_handoffs.fetch_add(1, std::memory_order_relaxed);
@@ -928,6 +938,10 @@ void MangoHybridCompute::graphicsThreadMain()
             const SegmentPlan& plan = m_plan[size_t(i)];
             const VkDeviceSize off = VkDeviceSize(plan.coeff_offset) * sizeof(s16);
             const VkDeviceSize bytes = VkDeviceSize(plan.samples) * sizeof(s16);
+            // One streaming copy of a finished, private range. Upload memory
+            // (write-combined / ReBAR) is for this, not for Huffman stores.
+            std::memcpy(reinterpret_cast<s16*>(m_frame_staging.mapped) + plan.coeff_offset,
+                m_host_coeffs.data() + plan.coeff_offset, size_t(bytes));
             m_allocator->flush(m_frame_staging.allocation, off, bytes);
 
             VkSubmitInfo submit =
@@ -1100,7 +1114,8 @@ MangoHybridResult runMangoHybridCompute(ConstMemory jpeg,
         return r;
     }
 
-    // Spectral (and progressive, if enabled later) write straight into the frame buffer.
+    // Cached host buffer. The upload mapping is filled later, one finished segment
+    // at a time, on the graphics thread.
     decoder.setCoeffStorage(compute.coeffStorage(), compute.coeffSamples());
 
     struct SinkState

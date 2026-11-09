@@ -36,9 +36,10 @@ struct MangoHybridResult
     mango::u64 gpu_wait_us = 0;
 };
 
-// Pre-allocated frame coeff storage with fixed per-segment offsets. Huffman sink only
-// memcpy's into its range and sets an atomic (no GPU, no waits). A graphics thread
-// submits one dispatch per segment, then waits all fences + layout (finish).
+// Huffman workers write cached host memory only. A finished segment is private:
+// the worker sets an atomic and returns. The graphics thread then streaming-copies
+// that range into the upload buffer and submits its dispatch. No worker waits on
+// the GPU, and no worker stores into host-visible / ReBAR memory.
 class MangoHybridCompute
 {
 public:
@@ -59,7 +60,7 @@ public:
 
     bool startFrame(const mango::image::jpeg::JpegInfo& info, int hardware_threads, std::string& error);
     bool handoffBand(const mango::image::jpeg::CoeffView& view, std::string& error);
-    mango::s16* coeffStorage() const;
+    mango::s16* coeffStorage();
     size_t coeffSamples() const { return m_frame_samples; }
     bool finishFrame(std::string& error);
 
@@ -110,6 +111,10 @@ private:
 
     mango::vulkan::BufferAllocation m_qt_buffer {};
     mango::vulkan::BufferAllocation m_frame_staging {};
+    // Cached DRAM. Huffman memset + scalar stores stay here. The upload mapping
+    // is write-combined or device-local (ReBAR); writing it from the entropy
+    // loop is several times slower than a full CPU decode.
+    std::vector<mango::s16> m_host_coeffs;
     size_t m_frame_samples = 0;
 
     std::vector<SegmentPlan> m_plan;
