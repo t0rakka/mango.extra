@@ -1,13 +1,11 @@
 
--------------------------------------------------------------------------------------------
-
+---------------------------------------------------------------------------------------------------------
 OS: Linux Mint
 Kernel: 6.8.0-149
 Compiler: G++ 14.2.0
 CPU: AMD TR 3990 (64 cores: 128 threads)
 GPU: nVidia GTX 2080ti
-
->>>>
+---------------------------------------------------------------------------------------------------------
 
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
@@ -19,15 +17,26 @@ nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->
 
 >>>>
 
--------------------------------------------------------------------------------------------
+file: rst.jpg
+backend                    READY    decode   promote   present       e2e  path
 
+... todo ...
+
+>>>>
+
+
+file: serial.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+... todo ...
+
+---------------------------------------------------------------------------------------------------------
 OS: Windows 11
 Version: 25H2
 Compiler: Visual Studio 17.13.3
 CPU: Intel i7-14700HX (8 P-cores, 12 E-cores: 28 threads)
 GPU: nVidia RTX 4070
-
->>>>
+---------------------------------------------------------------------------------------------------------
 
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
@@ -60,17 +69,13 @@ mango-gpu               353.82ms  347.31ms    1.31ms    0.58ms  354.40ms  file->
 nvjpeg-hybrid            27.48ms   23.62ms    3.85ms    0.64ms   28.12ms  file->VkImage
 nvjpeg-gpu               24.99ms   23.14ms    1.84ms    0.56ms   25.56ms  file->VkImage  fastest
 
->>>>
-
--------------------------------------------------------------------------------------------
-
+---------------------------------------------------------------------------------------------------------
 OS: Windows 11
 Version: 26H2
 Compiler: Visual Studio 18.6.1
 CPU: Intel i9-13900K (8 P-cores, 16 E-cores: 32 threads)
 GPU: nVidia RTX 4090
-
->>>>
+---------------------------------------------------------------------------------------------------------
 
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
@@ -82,15 +87,26 @@ nvjpeg-gpu                9.81ms    8.80ms    1.01ms    0.17ms    9.98ms  file->
 
 >>>>
 
--------------------------------------------------------------------------------------------
+file: rst.jpg
+backend                    READY    decode   promote   present       e2e  path
 
+... todo ...
+
+>>>>
+
+
+file: serial.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+... todo ...
+
+---------------------------------------------------------------------------------------------------------
 OS: Linux Arch
 Kernel: 7.2.14
 Compiler: G++ 16.2.1
 CPU: AMD Ryzen9 9950X3D (16 cores: 32 threads)
 GPU: AMD Radeon 9070 XT
-
->>>>
+---------------------------------------------------------------------------------------------------------
 
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
@@ -101,15 +117,26 @@ roc-hardware             96.59ms   93.86ms    2.72ms    0.16ms   96.76ms  file->
 
 >>>>
 
--------------------------------------------------------------------------------------------
+file: rst.jpg
+backend                    READY    decode   promote   present       e2e  path
 
+... todo ...
+
+>>>>
+
+
+file: serial.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+... todo ...
+
+---------------------------------------------------------------------------------------------------------
 OS: macOS Golden Gate
 Version: 27.0.1
 Compiler: Apple clang 21.0.0 (clang-2100.3.34.2)
 CPU: Apple M4 (12 Performance, 4 Efficiency: 16 threads)
 GPU: Apple M4 Max (40 cores)
-
->>>>
+---------------------------------------------------------------------------------------------------------
 
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
@@ -121,4 +148,22 @@ apple-imageio            37.70ms   37.61ms    0.09ms    1.09ms   38.81ms  file->
 
 >>>>
 
--------------------------------------------------------------------------------------------
+file: rst.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    21.16ms    3.76ms   14.81ms    7.94ms   29.11ms  host->VkImage
+mango-hybrid             14.86ms    2.55ms   12.31ms    1.60ms   19.90ms  file->VkImage
+mango-gpu                 8.60ms    5.29ms    1.25ms    0.61ms    9.20ms  file->VkImage  fastest
+apple-vt [hw]            11.94ms   11.85ms    0.09ms    1.60ms   13.57ms  file->VkImage
+apple-imageio            26.95ms   26.86ms    0.09ms    1.04ms   28.01ms  file->VkImage
+
+>>>>
+
+file: serial.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    37.04ms   20.07ms   14.31ms    8.60ms   45.64ms  host->VkImage
+mango-hybrid             20.91ms   20.53ms    0.38ms    1.55ms   26.08ms  file->VkImage
+mango-gpu               374.47ms  371.65ms    0.79ms    0.42ms  374.89ms  file->VkImage
+apple-vt [hw]            12.02ms   11.93ms    0.09ms    1.38ms   13.41ms  file->VkImage  fastest
+apple-imageio            27.44ms   27.36ms    0.07ms    0.97ms   28.43ms  file->VkImage
