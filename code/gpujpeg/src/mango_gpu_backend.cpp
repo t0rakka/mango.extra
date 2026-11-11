@@ -77,13 +77,20 @@ static_assert(sizeof(CarryGpu) == 48, "CarryGpu must match the Huffman shader");
 
 // Must match layout(local_size_x) in the Huffman shader.
 constexpr std::uint32_t kSyncLanes = 64;
-// Bytes of bitstream one lane walks. Kept small so a wave finishes well under
-// the GPU reset timeout. A serial scan is many waves, not one huge chunk.
+// Preferred chunk. Grown per file so the largest segment still fits in one
+// workgroup and every lane walks its own piece in a single dispatch.
 constexpr std::uint32_t kTargetChunk = 256;
 
-std::uint32_t chooseChunkBytes(const mango::image::jpeg::EntropyStream&)
+std::uint32_t chooseChunkBytes(const mango::image::jpeg::EntropyStream& stream)
 {
-    return kTargetChunk;
+    std::uint32_t max_size = 1;
+    for (const auto& seg : stream.segments)
+        max_size = std::max(max_size, std::uint32_t(seg.bytes.size));
+    std::uint32_t chunk = kTargetChunk;
+    const std::uint32_t need = (max_size + kSyncLanes - 1u) / kSyncLanes;
+    if (need > chunk)
+        chunk = need;
+    return chunk;
 }
 
 constexpr char kHuffmanSource[] = R"glsl(
@@ -134,12 +141,6 @@ layout(push_constant) uniform Push {
     uint pack[10];
 } pc;
 
-void storeCoeff(uint idx, int value)
-{
-    if (idx < uint(pc.coeffLimit))
-        coeffs[idx] = value;
-}
-
 struct St {
     uint pos;
     uint nbits;
@@ -184,10 +185,6 @@ uint pullByte(inout Reader r)
 
 void fill(inout Reader r, uint need)
 {
-    // Live bits sit in the low nbits of a 32-bit register. Pulling another
-    // byte once nbits is above 24 drops live bits. Baseline magnitudes are <= 16.
-    if (need > 24u)
-        need = 24u;
     while (r.nbits < need && r.pos < r.endp)
     {
         r.buf = (r.buf << 8) | pullByte(r);
@@ -195,30 +192,23 @@ void fill(inout Reader r, uint need)
     }
 }
 
-uint bitMask(uint n)
-{
-    if (n == 0u)
-        return 0u;
-    if (n >= 32u)
-        return 0xffffffffu;
-    return (1u << n) - 1u;
-}
-
 uint getBits(inout Reader r, uint n)
 {
-    // GLSL leaves 1u << n undefined for n >= 32. Speculative lanes ask for that.
-    if (n == 0u || n >= 32u)
+    // Real magnitudes are 1..11. A speculative lane can ask for 32 or more;
+    // that shift is undefined, and on AMD it collapses to a mask of zero.
+    // Return without shifting. cursorEq rejects any cursor that still
+    // reports nbits >= 32, so this lane is resynchronized from its neighbor.
+    if (n >= 32u)
         return 0u;
     fill(r, n);
     if (r.nbits < n)
         return 0u;
     r.nbits -= n;
-    return (r.buf >> r.nbits) & bitMask(n);
+    return (r.buf >> r.nbits) & ((1u << n) - 1u);
 }
 
 int extendSign(int v, int n)
 {
-    // Signed 1 << n is undefined at n >= 31. Real JPEG magnitudes are 1..11.
     if (n <= 0 || n >= 31)
         return v;
     int vt = 1 << (n - 1);
@@ -229,7 +219,6 @@ int extendSign(int v, int n)
 
 int decodeSym(inout Reader r, int ti)
 {
-    // Eight Huffman tables. A speculative index must not read off the SSBO.
     if (ti < 0 || ti > 7)
         return 0;
     fill(r, 8u);
@@ -268,7 +257,7 @@ int decodeSym(inout Reader r, int ti)
 }
 
 St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
-    int p0, int p1, int p2, int p3)
+    int p0, int p1, int p2, int p3, uint endIdx)
 {
     Reader r;
     r.pos = start.pos;
@@ -329,7 +318,8 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 else if (pi == 1) { shown = diff + pred1; pred1 = shown; }
                 else if (pi == 2) { shown = diff + pred2; pred2 = shown; }
                 else { shown = diff + pred3; pred3 = shown; }
-                storeCoeff(dst + s.n, shown);
+                if (dst + s.n < endIdx)
+                    coeffs[dst + s.n] = shown;
             }
             if (pi == 0) s.d0 += diff;
             else if (pi == 1) s.d1 += diff;
@@ -344,7 +334,10 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
             if (doWrite)
             {
                 for (uint k = 0u; k < left; ++k)
-                    storeCoeff(dst + s.n + k, 0);
+                {
+                    if (dst + s.n + k < endIdx)
+                        coeffs[dst + s.n + k] = 0;
+                }
             }
             s.n += left;
             s.z = 0u;
@@ -365,7 +358,10 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 if (doWrite)
                 {
                     for (uint k = 0u; k < zeros; ++k)
-                        storeCoeff(dst + s.n + k, 0);
+                    {
+                        if (dst + s.n + k < endIdx)
+                            coeffs[dst + s.n + k] = 0;
+                    }
                 }
                 s.n += zeros;
                 if (endBlock)
@@ -392,14 +388,17 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 if (doWrite)
                 {
                     for (uint k = 0u; k < zeros; ++k)
-                        storeCoeff(dst + s.n + k, 0);
+                    {
+                        if (dst + s.n + k < endIdx)
+                            coeffs[dst + s.n + k] = 0;
+                    }
                 }
                 s.n += zeros;
                 s.z += zeros;
                 if (hasValue && s.z < 64u)
                 {
-                    if (doWrite)
-                        storeCoeff(dst + s.n, mag);
+                    if (doWrite && dst + s.n < endIdx)
+                        coeffs[dst + s.n] = mag;
                     s.n += 1u;
                     s.z += 1u;
                 }
@@ -420,6 +419,31 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
     return s;
 }
 
+// Cursor identity. A shift of 32 or more is undefined in GLSL; AMD masks the
+// count to 5 bits, so (1u << 32) becomes 1 and the mask is 0. Every speculative
+// cursor then compares equal and lanes after the first commit a bad block.
+bool cursorEq(St a, St b)
+{
+    if (a.pos != b.pos || a.nbits != b.nbits || a.z != b.z || a.bi != b.bi)
+        return false;
+    if (a.nbits == 0u)
+        return true;
+    if (a.nbits >= 32u)
+        return false;
+    uint mask = (1u << a.nbits) - 1u;
+    return (a.buf & mask) == (b.buf & mask);
+}
+
+shared St spec[64];
+shared St got[64];
+shared uint matched[64];
+shared uint frontier;
+shared int baseN[64];
+shared int p0s[64];
+shared int p1s[64];
+shared int p2s[64];
+shared int p3s[64];
+
 void main()
 {
     uint lid = gl_LocalInvocationID.x;
@@ -428,85 +452,134 @@ void main()
     uint segBegin = seg.offset;
     uint segEnd = seg.offset + seg.size;
     uint chunk = max(uint(pc.chunkBytes), 1u);
-    uint total = (seg.size + chunk - 1u) / chunk;
-    uint base = uint(pc.waveBase);
-    uint nchunks = 0u;
-    if (base < total)
+    uint nchunks = (seg.size + chunk - 1u) / chunk;
+    if (nchunks > 64u)
+        nchunks = 64u;
+
+    // Every lane speculates from its own byte boundary. Lane 0 is the real
+    // start. Later lanes adopt the corrected cursor one chunk at a time, and
+    // skip ahead when a speculation already landed on that cursor.
+    if (lid < nchunks)
     {
-        nchunks = total - base;
-        if (nchunks > 64u)
-            nchunks = 64u;
+        St start;
+        start.pos = segBegin + lid * chunk;
+        start.nbits = 0u;
+        start.buf = 0u;
+        start.z = 0u;
+        start.bi = 0u;
+        start.n = 0u;
+        start.d0 = 0;
+        start.d1 = 0;
+        start.d2 = 0;
+        start.d3 = 0;
+        uint end = start.pos + chunk;
+        if (end > segEnd)
+            end = segEnd;
+        spec[lid] = walkChunk(start, end, segEnd, 0u, false, 0, 0, 0, 0, 0u);
     }
+    if (lid == 0u)
+        frontier = 1u;
+    barrier();
 
-    // Later waves continue the resolved cursor. Wave 0 starts on a byte boundary.
-    Carry incoming;
-    incoming.pos = segBegin;
-    incoming.nbits = 0u;
-    incoming.buf = 0u;
-    incoming.z = 0u;
-    incoming.bi = 0u;
-    incoming.p0 = 0;
-    incoming.p1 = 0;
-    incoming.p2 = 0;
-    incoming.p3 = 0;
-    incoming.coeffBase = 0u;
-    incoming.rounds = 0u;
-    incoming.pad = 0u;
-    if (pc.waveBase > 0)
-        incoming = carry[gid];
-
-    // One lane walks the wave's chunks in order. The parallel cursor search
-    // disagrees with this GPU: every lane but the first writes a bad block.
-    if (nchunks > 0u && lid == 0u)
+    uint rounds = 0u;
+    for (uint round = 0u; round < 64u; ++round)
     {
-        St cursor;
-        cursor.pos = incoming.pos;
-        cursor.nbits = incoming.nbits;
-        cursor.buf = incoming.buf;
-        cursor.z = incoming.z;
-        cursor.bi = incoming.bi;
-        cursor.n = 0u;
-        cursor.d0 = 0;
-        cursor.d1 = 0;
-        cursor.d2 = 0;
-        cursor.d3 = 0;
-        int p0 = incoming.p0;
-        int p1 = incoming.p1;
-        int p2 = incoming.p2;
-        int p3 = incoming.p3;
-        uint coeff = incoming.coeffBase;
-        for (uint c = 0u; c < nchunks; ++c)
+        if (frontier >= nchunks)
+            break;
+        rounds = round + 1u;
+
+        if (lid >= frontier && lid < nchunks)
         {
-            uint end = segBegin + (base + c + 1u) * chunk;
+            uint end = segBegin + (lid + 1u) * chunk;
             if (end > segEnd)
                 end = segEnd;
-            uint dst = seg.y0 * uint(pc.xmcu) * uint(pc.blocks) * 64u + coeff;
-            St w = walkChunk(cursor, end, segEnd, dst, true, p0, p1, p2, p3);
-            p0 += w.d0;
-            p1 += w.d1;
-            p2 += w.d2;
-            p3 += w.d3;
-            coeff += w.n;
-            cursor.pos = w.pos;
-            cursor.nbits = w.nbits;
-            cursor.buf = w.buf;
-            cursor.z = w.z;
-            cursor.bi = w.bi;
+            St st = walkChunk(spec[lid - 1u], end, segEnd, 0u, false, 0, 0, 0, 0, 0u);
+            got[lid] = st;
+            matched[lid] = cursorEq(st, spec[lid]) ? 1u : 0u;
+        }
+        barrier();
+
+        if (lid == 0u)
+        {
+            uint f = frontier;
+            while (f < nchunks)
+            {
+                spec[f] = got[f];
+                uint ok = matched[f];
+                f += 1u;
+                if (ok == 0u)
+                    break;
+            }
+            frontier = f;
+        }
+        barrier();
+    }
+
+    if (lid == 0u)
+    {
+        int acc = 0;
+        int a0 = 0;
+        int a1 = 0;
+        int a2 = 0;
+        int a3 = 0;
+        for (uint i = 0u; i < nchunks; ++i)
+        {
+            baseN[i] = acc;
+            p0s[i] = a0;
+            p1s[i] = a1;
+            p2s[i] = a2;
+            p3s[i] = a3;
+            acc += int(spec[i].n);
+            a0 += spec[i].d0;
+            a1 += spec[i].d1;
+            a2 += spec[i].d2;
+            a3 += spec[i].d3;
         }
         Carry outc;
-        outc.pos = cursor.pos;
-        outc.nbits = cursor.nbits;
-        outc.buf = cursor.buf;
-        outc.z = cursor.z;
-        outc.bi = cursor.bi;
-        outc.p0 = p0;
-        outc.p1 = p1;
-        outc.p2 = p2;
-        outc.p3 = p3;
-        outc.coeffBase = coeff;
-        outc.rounds = 1u;
+        outc.pos = 0u;
+        outc.nbits = 0u;
+        outc.buf = 0u;
+        outc.z = 0u;
+        outc.bi = 0u;
+        outc.p0 = 0;
+        outc.p1 = 0;
+        outc.p2 = 0;
+        outc.p3 = 0;
+        outc.coeffBase = 0u;
+        outc.rounds = rounds;
         outc.pad = 0u;
         carry[gid] = outc;
+    }
+    barrier();
+
+    if (lid < nchunks)
+    {
+        uint begin = segBegin + lid * chunk;
+        uint end = begin + chunk;
+        if (end > segEnd)
+            end = segEnd;
+        St start;
+        if (lid == 0u)
+        {
+            start.pos = segBegin;
+            start.nbits = 0u;
+            start.buf = 0u;
+            start.z = 0u;
+            start.bi = 0u;
+            start.n = 0u;
+            start.d0 = 0;
+            start.d1 = 0;
+            start.d2 = 0;
+            start.d3 = 0;
+        }
+        else
+            start = spec[lid - 1u];
+        uint stride = uint(pc.xmcu) * uint(pc.blocks) * 64u;
+        uint dst = seg.y0 * stride + uint(baseN[lid]);
+        // Pad bits sit between the last block and the restart marker. Decoding
+        // them emits coefficients past this segment and overwrites the next row.
+        uint endIdx = seg.y1 * stride;
+        walkChunk(start, end, segEnd, dst, true, p0s[lid], p1s[lid], p2s[lid], p3s[lid], endIdx);
     }
 }
 )glsl";
@@ -1408,84 +1481,54 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         const std::uint32_t n = (std::uint32_t(seg.bytes.size) + chunk - 1u) / chunk;
         max_chunks = std::max(max_chunks, std::max(n, 1u));
     }
-    const std::uint32_t waves = (max_chunks + kSyncLanes - 1u) / kSyncLanes;
+    if (max_chunks > kSyncLanes)
+    {
+        error = "entropy segment does not fit in one workgroup";
+        return false;
+    }
     const uint32_t groups = uint32_t(stream.segments.size());
+    push.waveBase = 0;
 
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes, %u waves\n",
-        groups, chunk, waves);
+    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
     std::fflush(stdout);
 
     const mango::u64 t0 = nowUs();
-    for (std::uint32_t wave = 0; wave < waves; ++wave)
-    {
-        push.waveBase = std::int32_t(wave * kSyncLanes);
+    vkResetCommandBuffer(m_cmd, 0);
+    vkBeginCommandBuffer(m_cmd, &begin);
 
-        vkResetCommandBuffer(m_cmd, 0);
-        vkBeginCommandBuffer(m_cmd, &begin);
+    VkMemoryBarrier host = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &host, 0, nullptr, 0, nullptr);
 
-        if (wave == 0)
-        {
-            VkMemoryBarrier host = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            };
-            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &host, 0, nullptr, 0, nullptr);
-        }
-        else
-        {
-            // Previous wave's cursor and coefficients were written by compute.
-            VkMemoryBarrier carried = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            };
-            vkCmdPipelineBarrier(m_cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &carried, 0, nullptr, 0, nullptr);
-        }
+    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
+    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
+        0, 1, &m_set, 0, nullptr);
+    vkCmdPushConstants(m_cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(m_cmd, groups, 1, 1);
 
-        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
-        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
-            0, 1, &m_set, 0, nullptr);
-        vkCmdPushConstants(m_cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(m_cmd, groups, 1, 1);
+    VkMemoryBarrier stats_ready = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &stats_ready, 0, nullptr, 0, nullptr);
+    const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(CarryGpu);
+    VkBufferCopy stats_region = { 0, 0, stat_bytes };
+    vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
+    vkEndCommandBuffer(m_cmd);
 
-        if (wave + 1u == waves)
-        {
-            VkMemoryBarrier stats_ready = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            };
-            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 1, &stats_ready, 0, nullptr, 0, nullptr);
-            const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(CarryGpu);
-            VkBufferCopy stats_region = { 0, 0, stat_bytes };
-            vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
-        }
-        else
-        {
-            VkMemoryBarrier published = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            };
-            vkCmdPipelineBarrier(m_cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &published, 0, nullptr, 0, nullptr);
-        }
-        vkEndCommandBuffer(m_cmd);
-
-        if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
-            return false;
-    }
+    if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
+        return false;
     huffman_us = nowUs() - t0;
 
     int max_rounds = 0;

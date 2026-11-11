@@ -163,10 +163,11 @@ GPU: Apple M4 Max (40 cores)
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    19.92ms    3.77ms   13.84ms    8.02ms   27.94ms  host->VkImage
-mango-hybrid             17.95ms    2.34ms   15.61ms    1.09ms   23.05ms  file->VkImage
-apple-vt [hw]            14.02ms   13.93ms    0.09ms    1.25ms   15.29ms  file->VkImage  fastest
-apple-imageio            37.70ms   37.61ms    0.09ms    1.09ms   38.81ms  file->VkImage
+mango                    28.39ms    3.66ms   22.51ms    8.38ms   36.76ms  host->VkImage
+mango-hybrid             20.05ms    2.40ms   17.65ms    1.34ms   25.58ms  file->VkImage
+mango-gpu                 8.83ms    5.26ms    1.90ms    0.46ms    9.29ms  file->VkImage  fastest
+apple-vt [hw]            13.89ms   13.79ms    0.10ms    1.83ms   15.73ms  file->VkImage
+apple-imageio            37.69ms   37.61ms    0.08ms    1.86ms   39.59ms  file->VkImage
 
 >>>>
 

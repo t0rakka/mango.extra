@@ -283,18 +283,41 @@ int checkHybridImage(DecodedTexture& texture, ConstMemory jpeg,
 
     const auto* got = static_cast<const u8*>(texture.host_mapped);
     int max_delta = 0;
+    int bad = 0;
+    int first_x = -1;
+    int first_y = -1;
+    int last_y = -1;
+    int bad_rows = 0;
+    int row_bad = 0;
     for (int y = 0; y < texture.height; ++y)
     {
         const u8* row = got + size_t(y) * size_t(texture.width) * 4;
         const u8* ref = cpu.address<u8>(0, y);
         const size_t n = size_t(texture.width) * 4;
+        row_bad = 0;
         for (size_t i = 0; i < n; ++i)
         {
             const int d = std::abs(int(row[i]) - int(ref[i]));
             if (d > max_delta)
                 max_delta = d;
+            if (d > 4)
+            {
+                ++bad;
+                ++row_bad;
+                if (first_x < 0)
+                {
+                    first_x = int(i / 4);
+                    first_y = y;
+                }
+                last_y = y;
+            }
         }
+        if (row_bad)
+            ++bad_rows;
     }
+    if (bad > 0)
+        printLine("  check mismatch: {} samples, {} rows, first {},{} last y {}",
+            bad, bad_rows, first_x, first_y, last_y);
     return max_delta;
 }
 
@@ -1118,6 +1141,16 @@ public:
                 job.gpu->compile_last_us
                     ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
                     : "");
+
+            if (std::getenv("GPUJPEG_CHECK"))
+            {
+                const int delta = checkHybridImage(texture, jpeg,
+                    graphicsQueue(), graphicsQueueFamilyIndex(), error);
+                if (delta < 0)
+                    printLine("  gpu check FAILED: {}", error);
+                else
+                    printLine("  gpu check: max |gpu-cpu| = {}", delta);
+            }
 
             const u64 t_pr0 = nowUs();
             if (!presentSlotFullscreen(texture))
