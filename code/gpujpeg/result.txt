@@ -4,79 +4,121 @@
 OS: Linux Mint
 Kernel: 6.8.0-149
 Compiler: G++ 14.2.0
-
 CPU: AMD TR 3990 (64 cores: 128 threads)
 GPU: nVidia GTX 2080ti
 
+>>>>
+
+file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    35.26ms    4.02ms   12.14ms    7.34ms   42.61ms  host->VkImage
 mango-hybrid             15.95ms    3.88ms   12.07ms    0.37ms   55.86ms  file->VkImage
 nvjpeg-hybrid            44.95ms   39.89ms    5.06ms    0.35ms   45.31ms  file->VkImage
-nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->VkImage
+nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->VkImage  fastest
+
+>>>>
 
 -------------------------------------------------------------------------------------------
 
 OS: Windows 11
 Version: 25H2
 Compiler: Visual Studio 17.13.3
-
-CPU: Intel i7-14700HX
+CPU: Intel i7-14700HX (8 P-cores, 12 E-cores: 28 threads)
 GPU: nVidia RTX 4070
 
+>>>>
+
+file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    24.32ms    9.99ms    6.22ms    3.36ms   27.69ms  host->VkImage
 mango-hybrid             29.55ms    4.08ms   25.46ms    0.29ms   45.06ms  file->VkImage
-mango-gpu                 8.81ms    3.72ms    1.62ms    0.79ms    9.60ms  file->VkImage
+mango-gpu                 8.81ms    3.72ms    1.62ms    0.79ms    9.60ms  file->VkImage  fastest
 nvjpeg-hybrid            14.38ms   11.06ms    3.32ms    0.46ms   14.85ms  file->VkImage
 nvjpeg-gpu               13.02ms   11.08ms    1.93ms    0.39ms   13.41ms  file->VkImage
+
+>>>>
+
+file: rst.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    33.42ms    7.76ms    6.64ms    3.81ms   37.23ms  host->VkImage
+mango-hybrid             15.74ms    5.18ms   10.56ms    0.48ms   41.74ms  file->VkImage
+mango-gpu                 9.74ms    4.09ms    1.58ms    0.48ms   10.23ms  file->VkImage  fastest
+nvjpeg-hybrid            14.25ms   11.06ms    3.18ms    0.34ms   14.60ms  file->VkImage
+nvjpeg-gpu               13.94ms   11.76ms    2.17ms    0.68ms   14.62ms  file->VkImage
+
+>>>>
+
+file: serial.jpg
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    48.52ms   33.23ms    7.37ms    4.07ms   52.60ms  host->VkImage
+mango-hybrid             29.61ms   28.48ms    1.13ms    0.47ms   46.90ms  file->VkImage
+mango-gpu               353.82ms  347.31ms    1.31ms    0.58ms  354.40ms  file->VkImage
+nvjpeg-hybrid            27.48ms   23.62ms    3.85ms    0.64ms   28.12ms  file->VkImage
+nvjpeg-gpu               24.99ms   23.14ms    1.84ms    0.56ms   25.56ms  file->VkImage  fastest
+
+>>>>
 
 -------------------------------------------------------------------------------------------
 
 OS: Windows 11
 Version: 26H2
 Compiler: Visual Studio 18.6.1
-
 CPU: Intel i9-13900K (8 P-cores, 16 E-cores: 32 threads)
 GPU: nVidia RTX 4090
 
+>>>>
+
+file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    15.66ms    3.36ms    5.34ms    4.14ms   19.80ms  host->VkImage
 mango-hybrid              7.98ms    1.70ms    6.28ms    0.41ms   23.17ms  file->VkImage
 nvjpeg-hybrid            11.09ms    8.77ms    2.31ms    0.21ms   11.30ms  file->VkImage
-nvjpeg-gpu                9.81ms    8.80ms    1.01ms    0.17ms    9.98ms  file->VkImage
+nvjpeg-gpu                9.81ms    8.80ms    1.01ms    0.17ms    9.98ms  file->VkImage  fastest
+
+>>>>
 
 -------------------------------------------------------------------------------------------
 
 OS: Linux Arch
 Kernel: 7.2.14
 Compiler: G++ 16.2.1
-
 CPU: AMD Ryzen9 9950X3D (16 cores: 32 threads)
 GPU: AMD Radeon 9070 XT
 
+>>>>
+
+file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    10.88ms    3.13ms    5.80ms    1.36ms   12.24ms  host->VkImage
+mango                    10.88ms    3.13ms    5.80ms    1.36ms   12.24ms  host->VkImage  fastest
 mango-hybrid              7.95ms    1.62ms    6.32ms    0.21ms   16.80ms  file->VkImage
 roc-hardware             96.59ms   93.86ms    2.72ms    0.16ms   96.76ms  file->VkImage
+
+>>>>
 
 -------------------------------------------------------------------------------------------
 
 OS: macOS Golden Gate
 Version: 27.0.1
 Compiler: Apple clang 21.0.0 (clang-2100.3.34.2)
-
 CPU: Apple M4 (12 Performance, 4 Efficiency: 16 threads)
 GPU: Apple M4 Max (40 cores)
 
+>>>>
+
+file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    19.92ms    3.77ms   13.84ms    8.02ms   27.94ms  host->VkImage
 mango-hybrid             17.95ms    2.34ms   15.61ms    1.09ms   23.05ms  file->VkImage
-apple-vt [hw]            14.02ms   13.93ms    0.09ms    1.25ms   15.29ms  file->VkImage
+apple-vt [hw]            14.02ms   13.93ms    0.09ms    1.25ms   15.29ms  file->VkImage  fastest
 apple-imageio            37.70ms   37.61ms    0.09ms    1.09ms   38.81ms  file->VkImage
+
+>>>>
 
 -------------------------------------------------------------------------------------------
