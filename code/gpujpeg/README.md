@@ -3,19 +3,61 @@
 Standalone JPEG **GPU ingest workbench** next to mango (`../mango`).  
 **Functionality and numbers live here first.** Later: migrate to a mango plugin (most likely) or a separate library (less likely). Do not block features on mango packaging.
 
-This README is the handoff context for continuing on other machines (e.g. AMD / ROC).
+This README is the handoff context for continuing on other machines, and the roadmap for the GPU JPEG decoder. Read it before changing decode paths.
 
 ---
 
-## Design in one page
+## Roadmap
 
-**Goal:** drip JPEG bitstreams → **intermediate GPU texture ready to sample/compute** (`READY`). Swapchain blit is only a visual check (vsync-sensitive); it is not the ingest metric.
+**Why.** Almost nobody ships a JPEG path that is both fast and pleasant to call: file in, sampleable GPU texture out, on more than one graphics API. That is a thing people already want. This workbench is where it gets proven. Ease of use matters: a fast path that is painful to call will not be used.
 
-**No host bounce on the GPU path.** Do not D2H then re-upload. File → device decode → promote into an intermediate image the client owns.
+It sits next to two neighbors that solve a different problem. Basis Universal supercompression (already in mango) is for authored GPU block textures. DirectStorage is for feeding the GPU from disk with minimal CPU. JPEG is the photographic and camera case those two do not cover. The long-term plan is to fuse GPU JPEG decode, Basis, and DirectStorage into one coherent loading system that is fun to use and fast. They stay separate until each one is good. Mango stays the CPU JPEG library. This workbench owns the GPU backends until the API settles, then it can move into a mango plugin.
 
-**API shape (roadmap, not fully coded):** fire-and-forget `submit` into an internal queue; fixed **inflight** GPU slots drain the queue; optional **completion callback** (capture input buffer → free when that job is done). Client controls priority by submit order. Sync one-at-a-time is already a clear win vs CPU; inflight squeezes more hardware.
+**Now.** Latency of one file. File-at-a-time is enough. `READY` is the metric: from submit until the intermediate image is usable (fence signaled, layout sampleable). The swapchain blit is only a visual check.
 
-**Primary metric: `READY`** = start → intermediate image usable. Present/e2e = “finished on screen” only.
+**Graphics API.** Vulkan is the API we test with. It is flexible enough to stand in for the others while the decode paths settle. The product is not Vulkan-only. The same READY contract is meant for D3D11, D3D12, and OpenGL. Keep the public decode call free of Vulkan types so those backends can implement it. Shader and queue details stay inside the backend. Do not start the D3D or GL ports until the Vulkan path's one-file latency is in good shape.
+
+**Later.** Throughput of a batch (10+ files) as fast as possible. That is the primary end goal. Pipelining is per backend and waits until the bench is stressing batches. A 128-thread CPU gains from more than one file in flight because one JPEG cannot fill the pool. nvJPEG and others may want their own depth for the same reason. Do not build that scheduler yet.
+
+### Object lifetimes
+
+- **GPU JPEG decoder** (the workbench backend): create once, keep it. It owns compiled shaders, pipelines, and sessions. `create()` compiles those pipelines so the first texture in a scene is not the one that pays for shader compile. Destroying a per-file object must not throw the pipelines away.
+- **`mango::image::jpeg::JpegDecoder`**: one per file. Scan state is per image, and entropy views alias the caller's bytes. Reusing one parser across files does not work. The decoder creates parsers as it needs them.
+- The caller can free the file bytes when `decode()` returns. The backend copies the bitstream or the coefficients into its own storage before that.
+
+### Call shape
+
+```text
+decoder.decode(file, destination, on_ready)
+```
+
+Today the caller waits for `on_ready` before the next file. The same call can later be issued again while earlier files are still running. Each backend decides how many it overlaps. Completion may be out of order, so the callback identifies the task. The callback runs after the fence, on the graphics thread, and it stays short: it must not wait on another decode.
+
+Submit stays on one graphics thread (the thread that owns the Vulkan queue today; the same rule for the D3D and GL device later). Caller threads only enqueue. If the application already owns that queue, the frame thread pumps the decoder. A second thread submitting on the same queue races the renderer.
+
+One completion contract: sampleable RGBA. nvJPEG YUV resolve and Apple BGRA stay inside the backend. Errors use the same callback.
+
+In-flight work stays bounded. Each task needs a destination image and, on the hybrid path, a full-frame coefficient buffer. The caller either passes an image that lives until the callback, or returns a decoder-owned slot when finished with it.
+
+### Backend choice (later)
+
+Not implemented. Still collecting timings per machine (`result.txt`). The decoder will own every backend the device can run, and each file picks among the ones that can handle it. Lossless, progressive, or arithmetic files simply drop the backends that cannot decode them. If none remain, the same callback still delivers a texture via the CPU decoder. A static rank such as NVIDIA, then Apple VT, then AMD is only a sketch. Per-file shape (restart vs one serial scan) changes who wins. Do not hard-wire a rank until the tables say so.
+
+Size-specific state (VideoToolbox session, nvJPEG buffers) is recreated when dimensions change. Compute pipelines are not.
+
+### What is already true in code
+
+- `JpegDecoder` is per file: `decodePixels`, `decodeCoefficients` (`CoeffOrder::Spectral`, `CoeffSink`, `setCoeffStorage`), `extractEntropy`.
+- `MangoGpuDecoder` and `MangoHybridCompute` still keep their pipelines on the per-image object. A new object recompiles. Lifting those pipelines onto a long-lived decoder is the next API step. Do not paper over that by telling callers to reuse a one-shot decoder: `MangoGpuDecoder::upload()` accepts one bitstream, and its descriptors stay bound to that image.
+- Hybrid: Huffman workers never wait on the GPU, on a free buffer, or on each other. Segments may finish in any order. The graphics thread alone submits and waits on fences. Coefficient storage for the whole frame is allocated before the workers start.
+- mango-gpu Huffman is one workgroup per entropy segment, 64 lanes, one submit. Shifts of 32 or more are rejected (AMD masks the count to 5 bits and would otherwise accept a bad speculative cursor). Writes stop at the segment coefficient count so restart pad bits do not spill into the next MCU row.
+
+### Do not
+
+- Put a ring, `waitSlot`, or a GPU fence wait on the Huffman path.
+- D2H the image and upload it again on a GPU path.
+- Treat present/e2e as the ingest number. `READY` is the number.
+- Reintroduce timeline or binary semaphore chaining between bands (MoltenVK stall).
 
 ---
 
@@ -34,7 +76,7 @@ ROC           AMD rocJPEG (VK, SDK
 ```
 
 **Available** = CMake option ON ∩ SDK found at configure ∩ runtime device present.  
-`Auto` preference sketch: `NvJpeg → Roc → MangoHybrid → Mango`.
+`Auto` is not implemented. Ranking is a later task; see the roadmap. Do not treat any fixed order as the decision.
 
 CMake axes (see `CMakeLists.txt`): `GPUJPEG_SOURCE_*`, `GPUJPEG_OUTPUT_*`.
 
@@ -86,7 +128,7 @@ The published rocJPEG architecture table stops at gfx1102 (Navi3). RDNA4 (gfx120
 ## MANGO_HYBRID
 
 Uses public `mango::image::jpeg::JpegDecoder` (`CoeffOrder::Spectral` + `CoeffSink`)
-plus a Vulkan compute pass (IDCT + YCbCr→RGBA) with a 3-slot band ring.
+plus a Vulkan compute pass (IDCT + YCbCr→RGBA). Bands are whatever `decodeCoefficients` publishes; the graphics thread submits each one. There is no slot ring and no Huffman backpressure.
 Spectral coefficients stay s16 on the way to the GPU; the shader sign-extends them.
 
 | Step | Status |
@@ -168,10 +210,10 @@ On this box **full mango NEON decode (~3.7 ms) beats stopping at coefficients (~
 
 ---
 
-## Agent checklist (AMD / next steps)
+## Agent checklist
 
-1. Read this README + `src/backends.hpp`, `nvjpeg_backend.*`, `decoded_texture.*`, `main.cpp`.
-2. ROC source → Vulkan is in. Next: confirm `rocJpegCreate` on the Vulkan device (gfx1201 is not in AMD's published table).
-3. Port hybrid compute to OpenGL / D3D when those outputs land (VK path is reference).
-4. Keep output roadmap (GL/D3D) as plugins sharing the same READY/queue design.
-5. Stay stand-alone until the API settles; mango plugin is a later migration.
+1. Read the roadmap at the top of this file before changing a decode path. Then `src/backends.hpp`, the backend you are in, `decoded_texture.*`, and `main.cpp`.
+2. Current stage is one-file latency (`READY`). Batch throughput and auto backend selection are later. The API call shape should still allow a second `decode()` before the previous callback.
+3. Next structural step: a long-lived GPU JPEG decoder that keeps compiled pipelines, and a new `JpegDecoder` per file.
+4. ROC on gfx1201 (RX 9070 XT) is outside AMD's published JPEG-core table. A successful `rocJpegCreate` on that GPU is not evidence of a JPEG engine. Confirm on device before trusting the number.
+5. Stay stand-alone until the API settles. A mango plugin is a later migration. OpenGL / D3D outputs share the same READY contract when they land.
