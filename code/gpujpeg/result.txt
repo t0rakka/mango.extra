@@ -127,23 +127,30 @@ GPU: AMD Radeon 9070 XT
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    10.88ms    3.13ms    5.80ms    1.36ms   12.24ms  host->VkImage  fastest
-mango-hybrid              7.95ms    1.62ms    6.32ms    0.21ms   16.80ms  file->VkImage
-roc-hardware             96.59ms   93.86ms    2.72ms    0.16ms   96.76ms  file->VkImage
+mango                    10.74ms    2.60ms    6.05ms    1.01ms   11.75ms  host->VkImage  fastest
+mango-hybrid              8.55ms    1.74ms    6.80ms    0.19ms   15.29ms  file->VkImage
+mango-gpu                18.98ms   11.67ms    1.61ms    0.12ms   19.10ms  file->VkImage
+roc-hardware             53.33ms   50.73ms    2.59ms    0.12ms   53.45ms  file->VkImage
 
 >>>>
 
 file: rst.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-... todo ...
+mango                    11.03ms    3.19ms    5.71ms    0.84ms   11.87ms  host->VkImage  fastest
+mango-hybrid              7.32ms    1.85ms    5.47ms    0.18ms   13.76ms  file->VkImage
+mango-gpu                21.71ms   12.21ms    1.48ms    0.12ms   21.83ms  file->VkImage
+roc-hardware             74.71ms   72.24ms    2.46ms    0.11ms   74.83ms  file->VkImage
 
 >>>>
 
 file: serial.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-... todo ...
+mango                    32.44ms   24.65ms    5.57ms    0.97ms   33.41ms  host->VkImage
+mango-hybrid             23.90ms   23.32ms    0.58ms    0.15ms   29.64ms  file->VkImage  fastest
+mango-gpu              2023.70ms 2015.21ms    2.46ms    0.14ms 2023.84ms  file->VkImage
+roc-hardware             75.85ms   72.90ms    2.95ms    0.14ms   76.00ms  file->VkImage
 
 ---------------------------------------------------------------------------------------------------------
 OS: macOS Golden Gate

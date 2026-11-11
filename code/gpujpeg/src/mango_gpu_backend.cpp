@@ -51,24 +51,39 @@ struct PushData
     std::int32_t blocks;
     std::int32_t segCount;
     std::int32_t chunkBytes;
+    std::int32_t waveBase;
+    std::int32_t coeffLimit;
     std::uint32_t pack[10];
 };
 
+// Per-segment cursor carried from one 64-chunk wave to the next.
+// std430 stride is 48 bytes; the shader struct must match.
+struct CarryGpu
+{
+    std::uint32_t pos;
+    std::uint32_t nbits;
+    std::uint32_t buf;
+    std::uint32_t z;
+    std::uint32_t bi;
+    std::int32_t p0;
+    std::int32_t p1;
+    std::int32_t p2;
+    std::int32_t p3;
+    std::uint32_t coeffBase;
+    std::uint32_t rounds;
+    std::uint32_t pad;
+};
+static_assert(sizeof(CarryGpu) == 48, "CarryGpu must match the Huffman shader");
+
 // Must match layout(local_size_x) in the Huffman shader.
 constexpr std::uint32_t kSyncLanes = 64;
-// Preferred chunk. Grown per file so the largest segment still fits in one workgroup.
+// Bytes of bitstream one lane walks. Kept small so a wave finishes well under
+// the GPU reset timeout. A serial scan is many waves, not one huge chunk.
 constexpr std::uint32_t kTargetChunk = 256;
 
-std::uint32_t chooseChunkBytes(const mango::image::jpeg::EntropyStream& stream)
+std::uint32_t chooseChunkBytes(const mango::image::jpeg::EntropyStream&)
 {
-    std::uint32_t max_size = 1;
-    for (const auto& seg : stream.segments)
-        max_size = std::max(max_size, std::uint32_t(seg.bytes.size));
-    std::uint32_t chunk = kTargetChunk;
-    const std::uint32_t need = (max_size + kSyncLanes - 1u) / kSyncLanes;
-    if (need > chunk)
-        chunk = need;
-    return chunk;
+    return kTargetChunk;
 }
 
 constexpr char kHuffmanSource[] = R"glsl(
@@ -92,15 +107,38 @@ layout(std430, set = 0, binding = 2) readonly buffer Tables {
     uint vals[2048];
 } tb;
 layout(std430, set = 0, binding = 3) writeonly buffer Coeffs { int coeffs[]; };
-layout(std430, set = 0, binding = 4) writeonly buffer Stats { uint stats[]; };
+
+struct Carry {
+    uint pos;
+    uint nbits;
+    uint buf;
+    uint z;
+    uint bi;
+    int p0;
+    int p1;
+    int p2;
+    int p3;
+    uint coeffBase;
+    uint rounds;
+    uint pad;
+};
+layout(std430, set = 0, binding = 4) buffer Stats { Carry carry[]; };
 
 layout(push_constant) uniform Push {
     int xmcu;
     int blocks;
     int segCount;
     int chunkBytes;
+    int waveBase;
+    int coeffLimit;
     uint pack[10];
 } pc;
+
+void storeCoeff(uint idx, int value)
+{
+    if (idx < uint(pc.coeffLimit))
+        coeffs[idx] = value;
+}
 
 struct St {
     uint pos;
@@ -114,16 +152,6 @@ struct St {
     int d2;
     int d3;
 };
-
-shared St spec[64];
-shared St got[64];
-shared uint matched[64];
-shared uint frontier;
-shared int baseN[64];
-shared int p0s[64];
-shared int p1s[64];
-shared int p2s[64];
-shared int p3s[64];
 
 struct Reader {
     uint pos;
@@ -156,6 +184,10 @@ uint pullByte(inout Reader r)
 
 void fill(inout Reader r, uint need)
 {
+    // Live bits sit in the low nbits of a 32-bit register. Pulling another
+    // byte once nbits is above 24 drops live bits. Baseline magnitudes are <= 16.
+    if (need > 24u)
+        need = 24u;
     while (r.nbits < need && r.pos < r.endp)
     {
         r.buf = (r.buf << 8) | pullByte(r);
@@ -163,17 +195,32 @@ void fill(inout Reader r, uint need)
     }
 }
 
+uint bitMask(uint n)
+{
+    if (n == 0u)
+        return 0u;
+    if (n >= 32u)
+        return 0xffffffffu;
+    return (1u << n) - 1u;
+}
+
 uint getBits(inout Reader r, uint n)
 {
+    // GLSL leaves 1u << n undefined for n >= 32. Speculative lanes ask for that.
+    if (n == 0u || n >= 32u)
+        return 0u;
     fill(r, n);
     if (r.nbits < n)
         return 0u;
     r.nbits -= n;
-    return (r.buf >> r.nbits) & ((1u << n) - 1u);
+    return (r.buf >> r.nbits) & bitMask(n);
 }
 
 int extendSign(int v, int n)
 {
+    // Signed 1 << n is undefined at n >= 31. Real JPEG magnitudes are 1..11.
+    if (n <= 0 || n >= 31)
+        return v;
     int vt = 1 << (n - 1);
     if (v < vt)
         v -= (1 << n) - 1;
@@ -182,6 +229,9 @@ int extendSign(int v, int n)
 
 int decodeSym(inout Reader r, int ti)
 {
+    // Eight Huffman tables. A speculative index must not read off the SSBO.
+    if (ti < 0 || ti > 7)
+        return 0;
     fill(r, 8u);
     if (r.nbits >= 8u)
     {
@@ -209,20 +259,12 @@ int decodeSym(inout Reader r, int ti)
         if (mx >= 0 && code <= mx)
         {
             int idx = tb.valptr[base + L] + code - tb.mincode[base + L];
+            if (idx < 0 || idx > 255)
+                return 0;
             return int(tb.vals[ti * 256 + idx]);
         }
     }
     return 0;
-}
-
-bool cursorEq(St a, St b)
-{
-    if (a.pos != b.pos || a.nbits != b.nbits || a.z != b.z || a.bi != b.bi)
-        return false;
-    if (a.nbits == 0u)
-        return true;
-    uint mask = (1u << a.nbits) - 1u;
-    return (a.buf & mask) == (b.buf & mask);
 }
 
 St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
@@ -287,7 +329,7 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 else if (pi == 1) { shown = diff + pred1; pred1 = shown; }
                 else if (pi == 2) { shown = diff + pred2; pred2 = shown; }
                 else { shown = diff + pred3; pred3 = shown; }
-                coeffs[dst + s.n] = shown;
+                storeCoeff(dst + s.n, shown);
             }
             if (pi == 0) s.d0 += diff;
             else if (pi == 1) s.d1 += diff;
@@ -302,7 +344,7 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
             if (doWrite)
             {
                 for (uint k = 0u; k < left; ++k)
-                    coeffs[dst + s.n + k] = 0;
+                    storeCoeff(dst + s.n + k, 0);
             }
             s.n += left;
             s.z = 0u;
@@ -323,7 +365,7 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 if (doWrite)
                 {
                     for (uint k = 0u; k < zeros; ++k)
-                        coeffs[dst + s.n + k] = 0;
+                        storeCoeff(dst + s.n + k, 0);
                 }
                 s.n += zeros;
                 if (endBlock)
@@ -350,14 +392,14 @@ St walkChunk(St start, uint limitByte, uint segEndByte, uint dst, bool doWrite,
                 if (doWrite)
                 {
                     for (uint k = 0u; k < zeros; ++k)
-                        coeffs[dst + s.n + k] = 0;
+                        storeCoeff(dst + s.n + k, 0);
                 }
                 s.n += zeros;
                 s.z += zeros;
                 if (hasValue && s.z < 64u)
                 {
                     if (doWrite)
-                        coeffs[dst + s.n] = mag;
+                        storeCoeff(dst + s.n, mag);
                     s.n += 1u;
                     s.z += 1u;
                 }
@@ -385,111 +427,86 @@ void main()
     Seg seg = segs[gid];
     uint segBegin = seg.offset;
     uint segEnd = seg.offset + seg.size;
-    uint chunk = uint(pc.chunkBytes);
-    uint nchunks = (seg.size + chunk - 1u) / chunk;
-    if (nchunks > 64u)
-        nchunks = 64u;
-
-    if (lid < nchunks)
+    uint chunk = max(uint(pc.chunkBytes), 1u);
+    uint total = (seg.size + chunk - 1u) / chunk;
+    uint base = uint(pc.waveBase);
+    uint nchunks = 0u;
+    if (base < total)
     {
-        St start;
-        start.pos = segBegin + lid * chunk;
-        start.nbits = 0u;
-        start.buf = 0u;
-        start.z = 0u;
-        start.bi = 0u;
-        start.n = 0u;
-        start.d0 = 0;
-        start.d1 = 0;
-        start.d2 = 0;
-        start.d3 = 0;
-        uint end = start.pos + chunk;
-        if (end > segEnd)
-            end = segEnd;
-        spec[lid] = walkChunk(start, end, segEnd, 0u, false, 0, 0, 0, 0);
+        nchunks = total - base;
+        if (nchunks > 64u)
+            nchunks = 64u;
     }
 
-    if (lid == 0u)
-        frontier = 1u;
-    barrier();
+    // Later waves continue the resolved cursor. Wave 0 starts on a byte boundary.
+    Carry incoming;
+    incoming.pos = segBegin;
+    incoming.nbits = 0u;
+    incoming.buf = 0u;
+    incoming.z = 0u;
+    incoming.bi = 0u;
+    incoming.p0 = 0;
+    incoming.p1 = 0;
+    incoming.p2 = 0;
+    incoming.p3 = 0;
+    incoming.coeffBase = 0u;
+    incoming.rounds = 0u;
+    incoming.pad = 0u;
+    if (pc.waveBase > 0)
+        incoming = carry[gid];
 
-    uint rounds = 0u;
-    for (uint round = 0u; round < 64u; ++round)
+    // One lane walks the wave's chunks in order. The parallel cursor search
+    // disagrees with this GPU: every lane but the first writes a bad block.
+    if (nchunks > 0u && lid == 0u)
     {
-        if (frontier >= nchunks)
-            break;
-        rounds = round + 1u;
-
-        if (lid >= frontier && lid < nchunks)
+        St cursor;
+        cursor.pos = incoming.pos;
+        cursor.nbits = incoming.nbits;
+        cursor.buf = incoming.buf;
+        cursor.z = incoming.z;
+        cursor.bi = incoming.bi;
+        cursor.n = 0u;
+        cursor.d0 = 0;
+        cursor.d1 = 0;
+        cursor.d2 = 0;
+        cursor.d3 = 0;
+        int p0 = incoming.p0;
+        int p1 = incoming.p1;
+        int p2 = incoming.p2;
+        int p3 = incoming.p3;
+        uint coeff = incoming.coeffBase;
+        for (uint c = 0u; c < nchunks; ++c)
         {
-            uint end = segBegin + (lid + 1u) * chunk;
+            uint end = segBegin + (base + c + 1u) * chunk;
             if (end > segEnd)
                 end = segEnd;
-            St st = walkChunk(spec[lid - 1u], end, segEnd, 0u, false, 0, 0, 0, 0);
-            got[lid] = st;
-            matched[lid] = cursorEq(st, spec[lid]) ? 1u : 0u;
+            uint dst = seg.y0 * uint(pc.xmcu) * uint(pc.blocks) * 64u + coeff;
+            St w = walkChunk(cursor, end, segEnd, dst, true, p0, p1, p2, p3);
+            p0 += w.d0;
+            p1 += w.d1;
+            p2 += w.d2;
+            p3 += w.d3;
+            coeff += w.n;
+            cursor.pos = w.pos;
+            cursor.nbits = w.nbits;
+            cursor.buf = w.buf;
+            cursor.z = w.z;
+            cursor.bi = w.bi;
         }
-        barrier();
-
-        if (lid == 0u)
-        {
-            uint f = frontier;
-            while (f < nchunks)
-            {
-                spec[f] = got[f];
-                uint ok = matched[f];
-                f += 1u;
-                if (ok == 0u)
-                    break;
-            }
-            frontier = f;
-        }
-        barrier();
-    }
-
-        if (lid == 0u)
-        {
-            int acc = 0;
-            int a0 = 0;
-            int a1 = 0;
-            int a2 = 0;
-            int a3 = 0;
-            for (uint i = 0u; i < nchunks; ++i)
-            {
-                baseN[i] = acc;
-                p0s[i] = a0;
-                p1s[i] = a1;
-                p2s[i] = a2;
-                p3s[i] = a3;
-                acc += int(spec[i].n);
-                a0 += spec[i].d0;
-                a1 += spec[i].d1;
-                a2 += spec[i].d2;
-                a3 += spec[i].d3;
-            }
-            stats[gid] = rounds;
-        }
-    barrier();
-
-    if (lid < nchunks)
-    {
-        uint begin = segBegin + lid * chunk;
-        uint end = begin + chunk;
-        if (end > segEnd)
-            end = segEnd;
-        St start;
-        if (lid == 0u)
-        {
-            start.pos = segBegin;
-            start.nbits = 0u;
-            start.buf = 0u;
-            start.z = 0u;
-            start.bi = 0u;
-        }
-        else
-            start = spec[lid - 1u];
-        uint dst = seg.y0 * uint(pc.xmcu) * uint(pc.blocks) * 64u + uint(baseN[lid]);
-        walkChunk(start, end, segEnd, dst, true, p0s[lid], p1s[lid], p2s[lid], p3s[lid]);
+        Carry outc;
+        outc.pos = cursor.pos;
+        outc.nbits = cursor.nbits;
+        outc.buf = cursor.buf;
+        outc.z = cursor.z;
+        outc.bi = cursor.bi;
+        outc.p0 = p0;
+        outc.p1 = p1;
+        outc.p2 = p2;
+        outc.p3 = p3;
+        outc.coeffBase = coeff;
+        outc.rounds = 1u;
+        outc.pad = 0u;
+        carry[gid] = outc;
     }
 }
 )glsl";
@@ -1178,7 +1195,7 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         std::memcpy(m_qt.mapped, natural_qt, sizeof(natural_qt));
         allocator.flush(m_qt.allocation, 0, sizeof(natural_qt));
 
-        const VkDeviceSize stat_bytes = std::max<VkDeviceSize>(stream.segments.size(), 1) * sizeof(std::uint32_t);
+        const VkDeviceSize stat_bytes = std::max<VkDeviceSize>(stream.segments.size(), 1) * sizeof(CarryGpu);
         m_stats = allocator.createBuffer(stat_bytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             mango::vulkan::MemoryUsage::GpuOnly, false);
@@ -1372,6 +1389,10 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
     push.chunkBytes = std::int32_t(chunk);
     sync_chunks = std::int32_t(chunk);
     push.segCount = std::int32_t(stream.segments.size());
+    const std::uint64_t coeff_limit = std::uint64_t(std::max(stream.ymcu, 0))
+        * std::uint64_t(std::max(stream.xmcu, 0))
+        * std::uint64_t(std::max(stream.blocks_in_mcu, 0)) * 64ull;
+    push.coeffLimit = std::int32_t(std::min<std::uint64_t>(coeff_limit, 0x7fffffffull));
     for (int b = 0; b < stream.blocks_in_mcu; ++b)
     {
         const auto& block = stream.block[b];
@@ -1381,53 +1402,96 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         push.pack[b] = dc | (ac << 8) | (pred << 16);
     }
 
-    vkResetCommandBuffer(m_cmd, 0);
+    std::uint32_t max_chunks = 1;
+    for (const auto& seg : stream.segments)
+    {
+        const std::uint32_t n = (std::uint32_t(seg.bytes.size) + chunk - 1u) / chunk;
+        max_chunks = std::max(max_chunks, std::max(n, 1u));
+    }
+    const std::uint32_t waves = (max_chunks + kSyncLanes - 1u) / kSyncLanes;
+    const uint32_t groups = uint32_t(stream.segments.size());
+
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    vkBeginCommandBuffer(m_cmd, &begin);
 
-    VkMemoryBarrier host = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-    };
-    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &host, 0, nullptr, 0, nullptr);
-
-    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
-    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
-        0, 1, &m_set, 0, nullptr);
-    vkCmdPushConstants(m_cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-
-    const uint32_t groups = uint32_t(stream.segments.size());
-    vkCmdDispatch(m_cmd, groups, 1, 1);
-
-    VkMemoryBarrier stats_ready = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-    };
-    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 1, &stats_ready, 0, nullptr, 0, nullptr);
-    const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(std::uint32_t);
-    VkBufferCopy stats_region = { 0, 0, stat_bytes };
-    vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
-    vkEndCommandBuffer(m_cmd);
-
-    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
+    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes, %u waves\n",
+        groups, chunk, waves);
     std::fflush(stdout);
 
     const mango::u64 t0 = nowUs();
-    if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
-        return false;
+    for (std::uint32_t wave = 0; wave < waves; ++wave)
+    {
+        push.waveBase = std::int32_t(wave * kSyncLanes);
+
+        vkResetCommandBuffer(m_cmd, 0);
+        vkBeginCommandBuffer(m_cmd, &begin);
+
+        if (wave == 0)
+        {
+            VkMemoryBarrier host = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            };
+            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &host, 0, nullptr, 0, nullptr);
+        }
+        else
+        {
+            // Previous wave's cursor and coefficients were written by compute.
+            VkMemoryBarrier carried = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            vkCmdPipelineBarrier(m_cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &carried, 0, nullptr, 0, nullptr);
+        }
+
+        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
+        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
+            0, 1, &m_set, 0, nullptr);
+        vkCmdPushConstants(m_cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(m_cmd, groups, 1, 1);
+
+        if (wave + 1u == waves)
+        {
+            VkMemoryBarrier stats_ready = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 1, &stats_ready, 0, nullptr, 0, nullptr);
+            const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(CarryGpu);
+            VkBufferCopy stats_region = { 0, 0, stat_bytes };
+            vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
+        }
+        else
+        {
+            VkMemoryBarrier published = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            };
+            vkCmdPipelineBarrier(m_cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &published, 0, nullptr, 0, nullptr);
+        }
+        vkEndCommandBuffer(m_cmd);
+
+        if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
+            return false;
+    }
     huffman_us = nowUs() - t0;
 
     int max_rounds = 0;
-    const auto* round_ptr = static_cast<const std::uint32_t*>(m_stats_rb.mapped);
+    const auto* round_ptr = static_cast<const CarryGpu*>(m_stats_rb.mapped);
     for (uint32_t i = 0; i < groups; ++i)
-        max_rounds = std::max(max_rounds, int(round_ptr[i]));
+        max_rounds = std::max(max_rounds, int(round_ptr[i].rounds));
     sync_rounds = max_rounds;
     std::printf("mango-gpu: sync rounds max %d\n", max_rounds);
     std::fflush(stdout);
@@ -1509,20 +1573,7 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         / uint32_t(std::max(idct.mcus_per_group, 1));
     vkCmdDispatch(m_cmd, std::max(idct_groups, 1u), 1, 1);
 
-    VkImageMemoryBarrier to_sample = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = texture.image,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-    };
-    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &to_sample);
+    texture.recordPublishComputeStores(m_cmd);
     vkEndCommandBuffer(m_cmd);
 
     const mango::u64 t_idct = nowUs();

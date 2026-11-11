@@ -240,6 +240,16 @@ int checkHybridImage(DecodedTexture& texture, ConstMemory jpeg,
     vkCmdCopyImageToBuffer(cmd, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         texture.host_alloc.buffer, 1, &region);
 
+    VkMemoryBarrier to_host =
+    {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &to_host, 0, nullptr, 0, nullptr);
+
     VkImageMemoryBarrier to_read = to_src;
     to_read.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1570,6 +1580,13 @@ int main(int argc, const char* argv[])
 
     if (!commands.parse())
         return 1;
+    if (args.validate)
+    {
+        // Validation messages arrive as warnings and info. Those channels are off
+        // unless something asks for them.
+        printEnable(Print::Warning, true);
+        printEnable(Print::Info, true);
+    }
     if (!args.error.empty())
     {
         printLine("{}", args.error);
@@ -1911,6 +1928,61 @@ int main(int argc, const char* argv[])
         windowConfig = &deviceConfig;
     }
 #endif
+
+    // A non-null deviceCreateInfoPNext replaces mango's Vulkan 1.3 chain, so this
+    // duplicates dynamic rendering, timeline semaphores, and descriptor indexing.
+    const VkPhysicalDevice selected_device = selectPhysicalDevice(instance);
+    VkPhysicalDeviceDescriptorIndexingFeatures supported_indexing =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    };
+    VkPhysicalDeviceImageCompressionControlFeaturesEXT supported_compression =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT,
+        .pNext = &supported_indexing,
+    };
+    VkPhysicalDeviceFeatures2 supported_features =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &supported_compression,
+    };
+    bool compression_ext = false;
+    const auto device_extensions = getDeviceExtensionProperties(selected_device);
+    for (const VkExtensionProperties& ext : device_extensions)
+    {
+        if (std::strcmp(ext.extensionName, VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME) == 0)
+            compression_ext = true;
+    }
+    if (compression_ext)
+        vkGetPhysicalDeviceFeatures2(selected_device, &supported_features);
+
+    VkPhysicalDeviceImageCompressionControlFeaturesEXT compression_features =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT,
+        .imageCompressionControl = VK_TRUE,
+    };
+    VkPhysicalDeviceVulkan12Features features12 =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &compression_features,
+        .descriptorBindingStorageBufferUpdateAfterBind =
+            supported_indexing.descriptorBindingStorageBufferUpdateAfterBind,
+        .timelineSemaphore = VK_TRUE,
+    };
+    VkPhysicalDeviceVulkan13Features features13 =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &features12,
+        .dynamicRendering = VK_TRUE,
+    };
+    if (compression_ext && supported_compression.imageCompressionControl)
+    {
+        deviceConfig.physicalDevice = selected_device;
+        deviceConfig.deviceExtensions.push_back(VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);
+        deviceConfig.deviceCreateInfoPNext = &features13;
+        windowConfig = &deviceConfig;
+        printLine("image compression control: storage images uncompressed");
+    }
 
     BenchWindow window(ctx, win_w, win_h, width, height, cuda_export, windowConfig);
     window.jpeg = jpeg;

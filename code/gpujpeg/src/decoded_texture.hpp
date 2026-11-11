@@ -37,6 +37,10 @@ struct DecodedTexture
     mango::vulkan::Allocator* allocator = nullptr;
     mango::vulkan::ImageAllocation image_alloc {};
     mango::vulkan::BufferAllocation host_alloc {};
+    // Device-local copy of the storage image. Used when the device cannot
+    // disable image compression: compute stores update texels, and this copy
+    // rewrites them through the transfer path so the blit sees the same bytes.
+    mango::vulkan::BufferAllocation publish_alloc {};
 
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -95,6 +99,11 @@ struct DecodedTexture
     // Leaves this image as SHADER_READ_ONLY; leaves dst as TRANSFER_DST.
     void recordBlitTo(VkCommandBuffer cmd, VkImage dst_image,
         int32_t dst_x0, int32_t dst_y0, int32_t dst_x1, int32_t dst_y1);
+
+    // Image is GENERAL in this command buffer after compute imageStore.
+    // Leaves it SHADER_READ_ONLY. On devices that cannot disable compression,
+    // copies the texels out and back so the sampled image matches the stores.
+    void recordPublishComputeStores(VkCommandBuffer cmd);
 
     // Resting layout after upload/blit helpers: ready to sample / feed compute.
     void recordTransitionToShaderRead(VkCommandBuffer cmd);

@@ -218,11 +218,11 @@ void main()
 {
     uint mcu_index = gl_WorkGroupID.x;
     int mcu_rows = pc.mcu_rows;
-    int xmcu = pc.xmcu;
+    int xmcu = max(pc.xmcu, 1);
     int local_mcu_y = int(mcu_index / uint(xmcu));
     int mcu_x = int(mcu_index % uint(xmcu));
-    if (local_mcu_y >= mcu_rows)
-        return;
+    // Workgroup-uniform. A return above the barrier is undefined if any lane disagrees.
+    bool live = local_mcu_y < mcu_rows;
 
     int mcu_y = pc.mcu_y0 + local_mcu_y;
     int lx = int(gl_LocalInvocationID.x);
@@ -230,7 +230,7 @@ void main()
 
     // One thread per block in the MCU (up to blocks_in_mcu ≤ 10).
     int b = int(gl_LocalInvocationIndex);
-    if (b < pc.blocks_in_mcu)
+    if (live && b < pc.blocks_in_mcu)
     {
         int global_mcu = pc.mcu_y0 * pc.xmcu + int(mcu_index);
         int mcu_coeff = global_mcu * pc.blocks_in_mcu * 64;
@@ -245,7 +245,7 @@ void main()
     }
     barrier();
 
-    if (lx >= pc.xblock || ly >= pc.yblock)
+    if (!live || lx >= pc.xblock || ly >= pc.yblock)
         return;
 
     int px = mcu_x * pc.xblock + lx;
@@ -855,6 +855,32 @@ bool MangoHybridCompute::recordBandCommand(const SegmentPlan& plan, SegmentGpu& 
     };
     vkBeginCommandBuffer(gpu.cmd, &begin);
 
+    // Host coefficient writes are available after flush. They are not visible to
+    // the shader until this dependency. The image barrier orders earlier compute
+    // stores to the same VkImage (submission order alone is not a memory dependency).
+    VkMemoryBarrier host_to_shader =
+    {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    VkImageMemoryBarrier order_stores =
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = m_texture->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(gpu.cmd,
+        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &host_to_shader, 0, nullptr, 1, &order_stores);
+
     const int rows = plan.mcu_y1 - plan.mcu_y0;
     PushConstants pc = makePush(m_info, plan.mcu_y0, rows);
     vkCmdBindPipeline(gpu.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
@@ -1009,24 +1035,8 @@ bool MangoHybridCompute::recordLayoutToSampleReady(std::string& /*error*/)
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(m_layout_cmd, &begin);
-    VkImageMemoryBarrier barrier =
-    {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = m_texture->image,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-    };
-    vkCmdPipelineBarrier(m_layout_cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    m_texture->recordPublishComputeStores(m_layout_cmd);
     vkEndCommandBuffer(m_layout_cmd);
-    m_texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     return true;
 }
 

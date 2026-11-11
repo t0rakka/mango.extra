@@ -467,6 +467,31 @@ bool DecodedTexture::create(VulkanWindow& window, Allocator& alloc,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 
+    // Compute imageStore does not maintain AMD DCC metadata. A later blit can
+    // sample that metadata while a buffer copy still sees the raw texels.
+    // VK_IMAGE_COMPRESSION_DISABLED_EXT keeps the two views of the image the same.
+    VkImageCompressionControlEXT compression =
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+        .flags = VK_IMAGE_COMPRESSION_DISABLED_EXT,
+    };
+    mango::vulkan::DeviceExtensionProperties device_ext(physical);
+    if (device_ext.contains(VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME))
+    {
+        VkPhysicalDeviceImageCompressionControlFeaturesEXT compression_feature =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT,
+        };
+        VkPhysicalDeviceFeatures2 features2 =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &compression_feature,
+        };
+        vkGetPhysicalDeviceFeatures2(physical, &features2);
+        if (compression_feature.imageCompressionControl)
+            image_info.pNext = &compression;
+    }
+
     image_alloc = alloc.createImage(image_info, MemoryUsage::GpuOnly);
     if (!image_alloc)
     {
@@ -500,7 +525,9 @@ bool DecodedTexture::create(VulkanWindow& window, Allocator& alloc,
 
     layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    host_alloc = alloc.createBuffer(rgba_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    // SRC feeds the upload copy. DST is the GPUJPEG_CHECK image readback.
+    host_alloc = alloc.createBuffer(rgba_bytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         MemoryUsage::Upload, true);
     if (!host_alloc || !host_alloc.mapped)
     {
@@ -509,6 +536,21 @@ bool DecodedTexture::create(VulkanWindow& window, Allocator& alloc,
         return false;
     }
     host_mapped = host_alloc.mapped;
+
+    // Compression control is off on this device. Keep a device-local buffer so
+    // compute stores can be rewritten through vkCmdCopyBufferToImage.
+    if (!image_info.pNext)
+    {
+        publish_alloc = alloc.createBuffer(rgba_bytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            MemoryUsage::GpuOnly, false);
+        if (!publish_alloc)
+        {
+            error = "Allocator::createBuffer (publish) failed";
+            destroy();
+            return false;
+        }
+    }
 
     if (enable_cuda_export)
     {
@@ -573,10 +615,13 @@ void DecodedTexture::destroy()
     {
         if (host_alloc)
             allocator->destroyBuffer(host_alloc);
+        if (publish_alloc)
+            allocator->destroyBuffer(publish_alloc);
         if (image_alloc)
             allocator->destroyImage(image_alloc);
     }
     host_alloc = {};
+    publish_alloc = {};
     image_alloc = {};
     host_mapped = nullptr;
     image = VK_NULL_HANDLE;
@@ -874,6 +919,79 @@ void DecodedTexture::recordTransitionToShaderRead(VkCommandBuffer cmd)
     imageBarrier(cmd, image, layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void DecodedTexture::recordPublishComputeStores(VkCommandBuffer cmd)
+{
+    if (!image)
+        return;
+
+    if (!publish_alloc)
+    {
+        imageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+        layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        return;
+    }
+
+    imageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region =
+    {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource =
+        {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { uint32_t(width), uint32_t(height), 1 },
+    };
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        publish_alloc.buffer, 1, &region);
+
+    VkBufferMemoryBarrier buffer_ready =
+    {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = publish_alloc.buffer,
+        .offset = 0,
+        .size = VK_WHOLE_SIZE,
+    };
+    VkImageMemoryBarrier to_dst =
+    {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 1, &buffer_ready, 1, &to_dst);
+
+    vkCmdCopyBufferToImage(cmd, publish_alloc.buffer, image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    imageBarrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
     layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
