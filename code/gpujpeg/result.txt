@@ -10,25 +10,33 @@ GPU: nVidia GTX 2080ti
 file: mango1.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    35.26ms    4.02ms   12.14ms    7.34ms   42.61ms  host->VkImage
-mango-hybrid             15.95ms    3.88ms   12.07ms    0.37ms   55.86ms  file->VkImage
-nvjpeg-hybrid            44.95ms   39.89ms    5.06ms    0.35ms   45.31ms  file->VkImage
-nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->VkImage  fastest
+mango                    36.61ms    4.52ms   11.99ms    8.06ms   44.67ms  host->VkImage
+mango-hybrid             16.46ms    3.54ms   12.92ms    0.43ms  124.02ms  file->VkImage
+mango-gpu                12.62ms    5.45ms    2.04ms    0.84ms   13.46ms  file->VkImage  fastest
+nvjpeg-hybrid            44.09ms   38.90ms    5.19ms    0.53ms   44.63ms  file->VkImage
+nvjpeg-gpu               39.90ms   36.71ms    3.19ms    0.42ms   40.33ms  file->VkImage
 
 >>>>
 
 file: rst.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-... todo ...
+mango                    37.16ms    5.45ms   12.06ms    9.48ms   46.64ms  host->VkImage
+mango-hybrid             11.29ms    2.85ms    8.44ms    0.48ms  108.70ms  file->VkImage
+mango-gpu                13.77ms    6.35ms    1.80ms    0.75ms   14.52ms  file->VkImage  fastest
+nvjpeg-hybrid            42.76ms   37.79ms    4.96ms    0.48ms   43.23ms  file->VkImage
+nvjpeg-gpu               41.06ms   37.77ms    3.29ms    0.49ms   41.56ms  file->VkImage
 
 >>>>
-
 
 file: serial.jpg
 backend                    READY    decode   promote   present       e2e  path
 
-... todo ...
+mango                    71.81ms   40.15ms   12.03ms    7.16ms   78.97ms  host->VkImage
+mango-hybrid             30.87ms   29.91ms    0.96ms    0.47ms  124.75ms  file->VkImage
+mango-gpu               408.80ms  400.04ms    1.60ms    0.51ms  409.31ms  file->VkImage
+nvjpeg-hybrid            67.56ms   63.51ms    4.04ms    0.43ms   67.98ms  file->VkImage
+nvjpeg-gpu               41.64ms   39.19ms    2.45ms    0.42ms   42.06ms  file->VkImage  fastest
 
 ---------------------------------------------------------------------------------------------------------
 OS: Windows 11
@@ -94,7 +102,6 @@ backend                    READY    decode   promote   present       e2e  path
 
 >>>>
 
-
 file: serial.jpg
 backend                    READY    decode   promote   present       e2e  path
 
@@ -123,7 +130,6 @@ backend                    READY    decode   promote   present       e2e  path
 ... todo ...
 
 >>>>
-
 
 file: serial.jpg
 backend                    READY    decode   promote   present       e2e  path
