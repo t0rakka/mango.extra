@@ -40,6 +40,8 @@ add_executable(gpujpeg
     src/mango_hybrid_backend.cpp
     src/mango_hybrid_compute.hpp
     src/mango_hybrid_compute.cpp
+    src/mango_gpu_backend.hpp
+    src/mango_gpu_backend.cpp
     src/roc_backend.hpp
     src/roc_backend.cpp
 )

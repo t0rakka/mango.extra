@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <mango/core/core.hpp>
@@ -41,6 +42,7 @@ struct PipelineResult
     int pipeline_count = 0;
     bool pipeline_overlapped = false;
     bool device_only = false;
+    bool bitstream_upload = false; // mango-gpu: packed entropy in a VkBuffer, no pixels yet
     bool ok = false;
     std::string error;
 };
@@ -76,9 +78,17 @@ inline void printPipeline(const PipelineResult& r)
         return;
     }
 
-    const bool huffman_floor = r.device_only && r.promote_us == 0 && r.present_us == 0;
+    const bool huffman_floor = r.device_only && !r.bitstream_upload && r.promote_us == 0 && r.present_us == 0;
 
-    if (huffman_floor)
+    if (r.bitstream_upload)
+    {
+        mango::printLine("  path:    file segments -> Huffman blocks (no IDCT yet)");
+        mango::printLine("  image:   {} x {}", r.image.width, r.image.height);
+        mango::printLine("  READY:   {:8.2f} ms   <-- coefficient blocks on device", r.ready_us / 1000.0);
+        mango::printLine("    upload:  {:8.2f} ms", r.promote_us / 1000.0);
+        mango::printLine("    huffman: {:8.2f} ms", r.decode_us / 1000.0);
+    }
+    else if (huffman_floor)
     {
         mango::printLine("  path:    Spectral Huffman floor (sink drops bands)");
         mango::printLine("  image:   {} x {} (coeffs only — no VkImage yet)",
@@ -131,6 +141,7 @@ inline void printPipeline(const PipelineResult& r)
                 m.name, m.us_from_start, m.us_from_start / 1000.0);
         }
     }
+    std::fflush(stdout);
 }
 
 } // namespace gpujpeg

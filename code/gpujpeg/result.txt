@@ -18,6 +18,23 @@ nvjpeg-gpu               40.31ms   37.16ms    3.15ms    0.33ms   40.64ms  file->
 -------------------------------------------------------------------------------------------
 
 OS: Windows 11
+Version: 25H2
+Compiler: Visual Studio 17.13.3
+
+CPU: Intel i7-14700HX
+GPU: nVidia RTX 4070
+
+backend                    READY    decode   promote   present       e2e  path
+
+mango                    24.32ms    9.99ms    6.22ms    3.36ms   27.69ms  host->VkImage
+mango-hybrid             29.55ms    4.08ms   25.46ms    0.29ms   45.06ms  file->VkImage
+mango-gpu                 8.81ms    3.72ms    1.62ms    0.79ms    9.60ms  file->VkImage
+nvjpeg-hybrid            14.38ms   11.06ms    3.32ms    0.46ms   14.85ms  file->VkImage
+nvjpeg-gpu               13.02ms   11.08ms    1.93ms    0.39ms   13.41ms  file->VkImage
+
+-------------------------------------------------------------------------------------------
+
+OS: Windows 11
 Version: 26H2
 Compiler: Visual Studio 18.6.1
 
