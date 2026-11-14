@@ -4,6 +4,8 @@
 #include <cstring>
 #include <vector>
 
+#include <mango/core/thread.hpp>
+
 #if defined(GPUJPEG_HAS_INTEL_VPL)
 #include <vpl/mfx.h>
 #include <vpl/mfxjpeg.h>
@@ -119,34 +121,45 @@ mfxStatus createJpegHwSession(mfxLoader loader, mfxSession* session)
     return MFXCreateSession(loader, 0, session);
 }
 
-// BT.601 limited-range-ish fast path (good enough for a latency bench).
+// BT.601 limited-range-ish (latency bench). Row-parallel — scalar CSC was a large
+// slice of the old ~70ms "decode" at 4K-ish.
 void nv12ToRgba(const mfxU8* y, int y_pitch,
     const mfxU8* uv, int uv_pitch,
     int width, int height, mfxU8* rgba)
 {
-    for (int row = 0; row < height; ++row)
+    mango::ConcurrentQueue queue;
+    const int rows_per_task = 16;
+    for (int row0 = 0; row0 < height; row0 += rows_per_task)
     {
-        const mfxU8* yrow = y + row * y_pitch;
-        const mfxU8* uvrow = uv + (row / 2) * uv_pitch;
-        mfxU8* out = rgba + size_t(row) * size_t(width) * 4;
-
-        for (int col = 0; col < width; ++col)
+        const int row1 = std::min(row0 + rows_per_task, height);
+        queue.enqueue([=]()
         {
-            const int Y = int(yrow[col]);
-            const int U = int(uvrow[(col & ~1) + 0]) - 128;
-            const int V = int(uvrow[(col & ~1) + 1]) - 128;
+            for (int row = row0; row < row1; ++row)
+            {
+                const mfxU8* yrow = y + row * y_pitch;
+                const mfxU8* uvrow = uv + (row / 2) * uv_pitch;
+                mfxU8* out = rgba + size_t(row) * size_t(width) * 4;
 
-            int r = Y + ((359 * V) >> 8);
-            int g = Y - ((88 * U + 183 * V) >> 8);
-            int b = Y + ((454 * U) >> 8);
+                for (int col = 0; col < width; ++col)
+                {
+                    const int Y = int(yrow[col]);
+                    const int U = int(uvrow[(col & ~1) + 0]) - 128;
+                    const int V = int(uvrow[(col & ~1) + 1]) - 128;
 
-            out[0] = mfxU8(std::clamp(r, 0, 255));
-            out[1] = mfxU8(std::clamp(g, 0, 255));
-            out[2] = mfxU8(std::clamp(b, 0, 255));
-            out[3] = 255;
-            out += 4;
-        }
+                    int r = Y + ((359 * V) >> 8);
+                    int g = Y - ((88 * U + 183 * V) >> 8);
+                    int b = Y + ((454 * U) >> 8);
+
+                    out[0] = mfxU8(std::clamp(r, 0, 255));
+                    out[1] = mfxU8(std::clamp(g, 0, 255));
+                    out[2] = mfxU8(std::clamp(b, 0, 255));
+                    out[3] = 255;
+                    out += 4;
+                }
+            }
+        });
     }
+    queue.wait();
 }
 
 void i420ToRgba(const mfxU8* y, int y_pitch,
@@ -154,30 +167,40 @@ void i420ToRgba(const mfxU8* y, int y_pitch,
     const mfxU8* v, int v_pitch,
     int width, int height, mfxU8* rgba)
 {
-    for (int row = 0; row < height; ++row)
+    mango::ConcurrentQueue queue;
+    const int rows_per_task = 16;
+    for (int row0 = 0; row0 < height; row0 += rows_per_task)
     {
-        const mfxU8* yrow = y + row * y_pitch;
-        const mfxU8* urow = u + (row / 2) * u_pitch;
-        const mfxU8* vrow = v + (row / 2) * v_pitch;
-        mfxU8* out = rgba + size_t(row) * size_t(width) * 4;
-
-        for (int col = 0; col < width; ++col)
+        const int row1 = std::min(row0 + rows_per_task, height);
+        queue.enqueue([=]()
         {
-            const int Y = int(yrow[col]);
-            const int U = int(urow[col / 2]) - 128;
-            const int V = int(vrow[col / 2]) - 128;
+            for (int row = row0; row < row1; ++row)
+            {
+                const mfxU8* yrow = y + row * y_pitch;
+                const mfxU8* urow = u + (row / 2) * u_pitch;
+                const mfxU8* vrow = v + (row / 2) * v_pitch;
+                mfxU8* out = rgba + size_t(row) * size_t(width) * 4;
 
-            int r = Y + ((359 * V) >> 8);
-            int g = Y - ((88 * U + 183 * V) >> 8);
-            int b = Y + ((454 * U) >> 8);
+                for (int col = 0; col < width; ++col)
+                {
+                    const int Y = int(yrow[col]);
+                    const int U = int(urow[col / 2]) - 128;
+                    const int V = int(vrow[col / 2]) - 128;
 
-            out[0] = mfxU8(std::clamp(r, 0, 255));
-            out[1] = mfxU8(std::clamp(g, 0, 255));
-            out[2] = mfxU8(std::clamp(b, 0, 255));
-            out[3] = 255;
-            out += 4;
-        }
+                    int r = Y + ((359 * V) >> 8);
+                    int g = Y - ((88 * U + 183 * V) >> 8);
+                    int b = Y + ((454 * U) >> 8);
+
+                    out[0] = mfxU8(std::clamp(r, 0, 255));
+                    out[1] = mfxU8(std::clamp(g, 0, 255));
+                    out[2] = mfxU8(std::clamp(b, 0, 255));
+                    out[3] = 255;
+                    out += 4;
+                }
+            }
+        });
     }
+    queue.wait();
 }
 
 bool surfaceToRgba(mfxFrameSurface1* surface, int width, int height,
@@ -425,7 +448,6 @@ bool IntelVplDecoder::decodeToHost(mango::ConstMemory jpeg, void* dest, size_t d
     }
 
     auto* impl = static_cast<Impl*>(m_impl);
-    const mango::u64 t0 = nowUs();
 
     mfxBitstream bitstream {};
     bitstream.Data = const_cast<mfxU8*>(reinterpret_cast<const mfxU8*>(jpeg.address));
@@ -433,119 +455,160 @@ bool IntelVplDecoder::decodeToHost(mango::ConstMemory jpeg, void* dest, size_t d
     bitstream.DataOffset = 0;
     bitstream.MaxLength = mfxU32(jpeg.size);
     bitstream.CodecId = MFX_CODEC_JPEG;
+    bitstream.DataFlag = MFX_BITSTREAM_COMPLETE_FRAME;
 
-    // Known-good still-JPEG path on this driver: Close+DecodeHeader+Init per call,
-    // sync via FrameInterface only. Warm Reset/SyncOperation both returned
-    // MFX_ERR_INVALID_VIDEO_PARAM here — revisit once we have a working baseline again.
-    impl->closeDecode();
+    mfxStatus sts = MFX_ERR_NONE;
 
-    mfxVideoParam params {};
-    params.mfx.CodecId = MFX_CODEC_JPEG;
-    params.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
-
-    mfxStatus sts = MFXVideoDECODE_DecodeHeader(impl->session, &bitstream, &params);
-    if (sts != MFX_ERR_NONE)
+    // mfx-gen JPEG stills: MFXVideoDECODE_Reset "succeeds" then Synchronize returns
+    // INVALID_VIDEO_PARAM. Warm path is: keep the decoder, feed the next complete
+    // frame. Fall back to Close+DecodeHeader+Init. decode_us times submit→sync→CSC only.
+    auto hardReinit = [&]() -> bool
     {
-        error = std::string("Intel VPL DecodeHeader failed: ") + mfxStatusString(sts);
-        return false;
-    }
+        impl->closeDecode();
 
-    params.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
+        mfxVideoParam params {};
+        params.mfx.CodecId = MFX_CODEC_JPEG;
+        params.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
 
-    sts = MFXVideoDECODE_Init(impl->session, &params);
-    if (sts < MFX_ERR_NONE)
-    {
-        error = std::string("Intel VPL DECODE_Init failed: ") + mfxStatusString(sts);
-        return false;
-    }
-    impl->decode_inited = true;
-    impl->params = params;
+        bitstream.DataOffset = 0;
+        bitstream.DataLength = mfxU32(jpeg.size);
+        bitstream.DataFlag = MFX_BITSTREAM_COMPLETE_FRAME;
 
-    const int out_w = params.mfx.FrameInfo.CropW
-        ? int(params.mfx.FrameInfo.CropW)
-        : int(params.mfx.FrameInfo.Width);
-    const int out_h = params.mfx.FrameInfo.CropH
-        ? int(params.mfx.FrameInfo.CropH)
-        : int(params.mfx.FrameInfo.Height);
-
-    if (out_w != width || out_h != height)
-    {
-        error = "Intel VPL: decoded size does not match init dimensions";
-        return false;
-    }
-
-    bitstream.DataOffset = 0;
-    bitstream.DataLength = mfxU32(jpeg.size);
-
-    mfxFrameSurface1* out_surface = nullptr;
-    mfxSyncPoint syncp = nullptr;
-    bool got_frame = false;
-
-    bool draining = false;
-    for (int attempt = 0; attempt < 64 && !got_frame; ++attempt)
-    {
-        sts = MFXVideoDECODE_DecodeFrameAsync(impl->session,
-            draining ? nullptr : &bitstream,
-            nullptr,
-            &out_surface,
-            &syncp);
-
-        if (sts == MFX_ERR_NONE && out_surface)
+        sts = MFXVideoDECODE_DecodeHeader(impl->session, &bitstream, &params);
+        if (sts != MFX_ERR_NONE)
         {
-            if (!out_surface->FrameInterface)
-            {
-                error = "Intel VPL: surface has no FrameInterface";
-                return false;
-            }
-
-            do
-            {
-                sts = out_surface->FrameInterface->Synchronize(out_surface, 1000);
-            } while (sts == MFX_WRN_IN_EXECUTION);
-
-            if (sts != MFX_ERR_NONE)
-            {
-                out_surface->FrameInterface->Release(out_surface);
-                error = std::string("Intel VPL Synchronize failed: ") + mfxStatusString(sts);
-                return false;
-            }
-
-            if (!surfaceToRgba(out_surface, width, height,
-                    static_cast<mfxU8*>(dest), dest_bytes, error))
-            {
-                out_surface->FrameInterface->Release(out_surface);
-                return false;
-            }
-            out_surface->FrameInterface->Release(out_surface);
-            got_frame = true;
-            break;
+            error = std::string("Intel VPL DecodeHeader failed: ") + mfxStatusString(sts);
+            return false;
         }
 
-        if (sts == MFX_ERR_MORE_DATA)
+        params.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
+        sts = MFXVideoDECODE_Init(impl->session, &params);
+        if (sts < MFX_ERR_NONE)
         {
-            if (draining)
+            error = std::string("Intel VPL DECODE_Init failed: ") + mfxStatusString(sts);
+            return false;
+        }
+        impl->decode_inited = true;
+        impl->params = params;
+
+        const int out_w = params.mfx.FrameInfo.CropW
+            ? int(params.mfx.FrameInfo.CropW)
+            : int(params.mfx.FrameInfo.Width);
+        const int out_h = params.mfx.FrameInfo.CropH
+            ? int(params.mfx.FrameInfo.CropH)
+            : int(params.mfx.FrameInfo.Height);
+        if (out_w != width || out_h != height)
+        {
+            error = "Intel VPL: decoded size does not match init dimensions";
+            return false;
+        }
+
+        bitstream.DataOffset = 0;
+        bitstream.DataLength = mfxU32(jpeg.size);
+        bitstream.DataFlag = MFX_BITSTREAM_COMPLETE_FRAME;
+        return true;
+    };
+
+    auto runSubmit = [&](mango::u64& timed_us) -> bool
+    {
+        const mango::u64 t0 = nowUs();
+        mfxFrameSurface1* out_surface = nullptr;
+        mfxSyncPoint syncp = nullptr;
+        bool got_frame = false;
+        bool draining = false;
+
+        bitstream.DataOffset = 0;
+        bitstream.DataLength = mfxU32(jpeg.size);
+        bitstream.DataFlag = MFX_BITSTREAM_COMPLETE_FRAME;
+
+        for (int attempt = 0; attempt < 64 && !got_frame; ++attempt)
+        {
+            sts = MFXVideoDECODE_DecodeFrameAsync(impl->session,
+                draining ? nullptr : &bitstream,
+                nullptr,
+                &out_surface,
+                &syncp);
+
+            if (sts == MFX_ERR_NONE && out_surface)
+            {
+                if (!out_surface->FrameInterface)
+                {
+                    error = "Intel VPL: surface has no FrameInterface";
+                    return false;
+                }
+
+                do
+                {
+                    sts = out_surface->FrameInterface->Synchronize(out_surface, 1000);
+                } while (sts == MFX_WRN_IN_EXECUTION);
+
+                if (sts != MFX_ERR_NONE)
+                {
+                    out_surface->FrameInterface->Release(out_surface);
+                    error = std::string("Intel VPL Synchronize failed: ") + mfxStatusString(sts);
+                    return false;
+                }
+
+                if (!surfaceToRgba(out_surface, width, height,
+                        static_cast<mfxU8*>(dest), dest_bytes, error))
+                {
+                    out_surface->FrameInterface->Release(out_surface);
+                    return false;
+                }
+                out_surface->FrameInterface->Release(out_surface);
+                got_frame = true;
                 break;
-            draining = true;
-            continue;
+            }
+
+            if (sts == MFX_ERR_MORE_DATA)
+            {
+                if (draining)
+                    break;
+                draining = true;
+                continue;
+            }
+            if (sts == MFX_WRN_DEVICE_BUSY || sts == MFX_ERR_MORE_SURFACE)
+                continue;
+
+            error = std::string("Intel VPL DecodeFrameAsync failed: ") + mfxStatusString(sts);
+            return false;
         }
 
-        if (sts == MFX_WRN_DEVICE_BUSY)
-            continue;
+        if (!got_frame)
+        {
+            error = "Intel VPL: no frame produced";
+            return false;
+        }
 
-        if (sts == MFX_ERR_MORE_SURFACE)
-            continue;
+        timed_us = nowUs() - t0;
+        return true;
+    };
 
-        error = std::string("Intel VPL DecodeFrameAsync failed: ") + mfxStatusString(sts);
-        return false;
-    }
-
-    if (!got_frame)
+    const bool try_reuse = impl->decode_inited;
+    if (!try_reuse)
     {
-        error = "Intel VPL: no frame produced";
-        return false;
+        if (!hardReinit())
+            return false;
     }
 
-    decode_us = nowUs() - t0;
+    mango::u64 timed_us = 0;
+    if (!runSubmit(timed_us))
+    {
+        if (!try_reuse)
+            return false;
+
+        // Reuse without Reset failed — full reinit once.
+        error.clear();
+        if (!hardReinit())
+            return false;
+        if (!runSubmit(timed_us))
+        {
+            impl->closeDecode();
+            return false;
+        }
+    }
+
+    decode_us = timed_us;
     return true;
 }
 
