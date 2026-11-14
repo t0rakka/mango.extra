@@ -2195,7 +2195,7 @@ int main(int argc, const char* argv[])
         const char* path = r.bitstream_upload ? "huffman-blocks"
             : ((r.device_only && r.promote_us == 0 && r.present_us == 0)
                 ? "huffman-floor"
-                : (r.igpu_host ? "igpu->host->VkImage"
+                : (r.igpu_host ? "igpu->VkImage"
                     : (r.device_only ? "file->VkImage" : "host->VkImage")));
         printLine("{:<22} {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms  {}",
             r.backend,
