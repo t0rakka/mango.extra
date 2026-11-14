@@ -9,6 +9,7 @@
 #include "mango_hybrid_compute.hpp"
 #include "nvjpeg_backend.hpp"
 #include "roc_backend.hpp"
+#include "intel_vpl_backend.hpp"
 #if defined(GPUJPEG_HAS_APPLE_VT)
 #include "apple_vt_backend.hpp"
 #include "apple_imageio_backend.hpp"
@@ -46,6 +47,7 @@ enum class Backend
     Gpu,     // mango-gpu: Mango1 entropy -> VkBuffer (Huffman compute later)
     NvJpeg,
     Roc,
+    IntelVpl, // QSV JPEG → host → VkImage (curiosity)
     AppleVt,
     AppleImageIo,
     Both,    // mango + nvjpeg
@@ -87,9 +89,10 @@ void configureParser(const CommandLine& commands, Args& args)
     commands.usage("[options] <file.jpg>");
 
     commands.option("--backend",
-        "mango | hybrid | gpu | nvjpeg | roc | apple-vt | apple-imageio | both | all (default all)\n"
+        "mango | hybrid | gpu | nvjpeg | roc | intel | apple-vt | apple-imageio | both | all (default all)\n"
         "         hybrid = Huffman+VK compute; gpu = Mango1/RST/serial entropy -> VkImage;\n"
-        "         roc = VCN JPEG; apple-vt = VideoToolbox;\n"
+        "         roc = VCN JPEG; intel = QSV JPEG (igpu→host→VkImage, curiosity);\n"
+        "         apple-vt = VideoToolbox;\n"
         "         apple-imageio = ImageIO still JPEG → BGRA IOSurface;\n"
         "         both = mango+nvjpeg; all = every built source",
         [&](std::string_view value)
@@ -104,6 +107,8 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::NvJpeg;
             else if (value == "roc")
                 args.backend = Backend::Roc;
+            else if (value == "intel" || value == "intel-vpl" || value == "qsv" || value == "vpl")
+                args.backend = Backend::IntelVpl;
             else if (value == "apple-vt" || value == "apple" || value == "vt")
                 args.backend = Backend::AppleVt;
             else if (value == "apple-imageio" || value == "imageio")
@@ -114,7 +119,7 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::All;
             else
                 args.error = fmt::format(
-                    "Invalid --backend \"{}\" (mango|hybrid|gpu|nvjpeg|roc|apple-vt|apple-imageio|both|all)", value);
+                    "Invalid --backend \"{}\" (mango|hybrid|gpu|nvjpeg|roc|intel|apple-vt|apple-imageio|both|all)", value);
         });
 
     commands.option("--nvjpeg-mode", "hybrid | gpu | both (default both). "
@@ -390,6 +395,7 @@ struct Job
     bool use_hybrid = false;
     bool use_gpu = false;
     bool use_roc = false;
+    bool use_intel_vpl = false;
     bool use_apple_vt = false;
     bool use_apple_imageio = false;
     bool hybrid_floor = false; // Huffman-only (skip VK compute)
@@ -397,6 +403,7 @@ struct Job
     RocJpegMode roc_mode = RocJpegMode::Hardware;
     NvJpegDecoder* decoder = nullptr;
     RocJpegDecoder* roc = nullptr;
+    IntelVplDecoder* intel = nullptr;
     MangoGpuDecoder* gpu = nullptr;
 };
 
@@ -1532,6 +1539,59 @@ public:
             return r;
         }
 
+        if (job.use_intel_vpl)
+        {
+            // Curiosity path: QSV on Intel iGPU → host RGBA → NVIDIA VkImage.
+            r.device_only = false;
+            r.igpu_host = true;
+            if (!job.intel || !job.intel->ok)
+            {
+                r.error = "Intel VPL decoder missing";
+                return r;
+            }
+
+            host_rgba.resize(texture.rgba_bytes);
+            u64 decode_us = 0;
+            if (!job.intel->decodeToHost(jpeg, host_rgba.data(), host_rgba.size(),
+                    decode_us, error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.decode_us = decode_us;
+            r.image.width = job.intel->width;
+            r.image.height = job.intel->height;
+            r.image.components = 4;
+            addMilestone(r.milestones, "qsv_decoded", t0);
+
+            const u64 t_up0 = nowUs();
+            std::memcpy(texture.host_mapped, host_rgba.data(), texture.rgba_bytes);
+            if (!texture.flushCopyHostToImage(graphicsQueue(), graphicsQueueFamilyIndex(), error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.promote_us = nowUs() - t_up0;
+            r.ready_us = nowUs() - t0;
+            addMilestone(r.milestones, "vk_ready", t0);
+
+            const u64 t_pr0 = nowUs();
+            if (!presentSlotFullscreen(texture))
+            {
+                r.error = "present blit failed";
+                return r;
+            }
+            r.present_us = nowUs() - t_pr0;
+            addMilestone(r.milestones, "presented", t0);
+
+            r.e2e_us = nowUs() - t0;
+            r.ok = true;
+            slot.ready = true;
+            setTitle(fmt::format("gpujpeg [{}] {}x{} (igpu→host→Vk)", job.name,
+                r.image.width, r.image.height));
+            return r;
+        }
+
         // SIMD decode into cached memory. The staging buffer is write-combined;
         // decoding into it directly is several times slower than one streaming copy.
         u64 decode_us = 0;
@@ -1633,11 +1693,12 @@ int main(int argc, const char* argv[])
 
     printLine(getSystemInfo());
     printLine("Workbench matrix (built):");
-    printLine("  sources: mango={} hybrid={} nvjpeg={} roc={}",
+    printLine("  sources: mango={} hybrid={} nvjpeg={} roc={} intel-vpl={}",
         sourceBuilt(DecodeSource::Mango),
         sourceBuilt(DecodeSource::MangoHybrid),
         sourceBuilt(DecodeSource::NvJpeg),
-        sourceBuilt(DecodeSource::Roc));
+        sourceBuilt(DecodeSource::Roc),
+        sourceBuilt(DecodeSource::IntelVpl));
     printLine("  outputs: vulkan={} opengl={} d3d11={} d3d12={}",
         outputBuilt(OutputApi::Vulkan),
         outputBuilt(OutputApi::OpenGL),
@@ -1658,6 +1719,18 @@ int main(int argc, const char* argv[])
                 dev.hardware ? "yes" : dev.hardware_error,
                 dev.hybrid ? "yes" : dev.hybrid_error);
         }
+    }
+    {
+        const IntelVplRuntimeInfo intel_info = queryIntelVplRuntime();
+        if (intel_info.hardware_jpeg)
+        {
+            printLine("Intel VPL runtime: yes ({})",
+                intel_info.impl_name.empty() ? "hardware JPEG" : intel_info.impl_name);
+        }
+        else if (!intel_info.error.empty())
+            printLine("Intel VPL runtime: no ({})", intel_info.error);
+        else
+            printLine("Intel VPL runtime: no");
     }
 
     const u64 t_file0 = nowUs();
@@ -1698,6 +1771,9 @@ int main(int argc, const char* argv[])
         args.backend == Backend::All;
     const bool want_roc =
         args.backend == Backend::Roc ||
+        args.backend == Backend::All;
+    const bool want_intel =
+        args.backend == Backend::IntelVpl ||
         args.backend == Backend::All;
     const bool want_apple =
         args.backend == Backend::AppleVt ||
@@ -1868,6 +1944,61 @@ int main(int argc, const char* argv[])
         }
 #else
         printLine("rocJPEG requested but not built (install rocjpeg and reconfigure).");
+#endif
+    }
+
+    std::vector<std::unique_ptr<IntelVplDecoder>> intel_decoders;
+    if (want_intel)
+    {
+#if defined(GPUJPEG_HAS_SOURCE_INTEL_VPL)
+        if (!intelVplAvailable())
+        {
+            const IntelVplRuntimeInfo info = queryIntelVplRuntime();
+            printLine("Intel VPL unavailable ({}).",
+                info.error.empty() ? "no hardware JPEG session" : info.error);
+            if (args.backend == Backend::IntelVpl)
+                return 1;
+        }
+        else
+        {
+            auto dec = std::make_unique<IntelVplDecoder>();
+            std::string error;
+            if (!dec->init(width, height, error))
+            {
+                printLine("intel-vpl init FAILED: {}", error);
+                if (args.backend == Backend::IntelVpl)
+                    return 1;
+            }
+            else
+            {
+                printLine("intel-vpl init: {:.2f} ms  (curiosity: igpu→host→VkImage)",
+                    dec->init_us / 1000.0);
+                if (!dec->warmup(jpeg, args.warmup, error))
+                {
+                    printLine("intel-vpl warmup FAILED: {}", error);
+                    if (args.backend == Backend::IntelVpl)
+                        return 1;
+                }
+                else
+                {
+                    if (args.warmup > 0)
+                    {
+                        printLine("intel-vpl warmup: {:.2f} ms ({} rounds)",
+                            dec->warmup_us / 1000.0, args.warmup);
+                    }
+                    Job job;
+                    job.name = "intel-vpl";
+                    job.use_intel_vpl = true;
+                    job.intel = dec.get();
+                    jobs.push_back(std::move(job));
+                    intel_decoders.push_back(std::move(dec));
+                }
+            }
+        }
+#else
+        printLine("Intel VPL requested but not built (vcpkg install libvpl:x64-windows --classic).");
+        if (args.backend == Backend::IntelVpl)
+            return 1;
 #endif
     }
 
@@ -2064,7 +2195,8 @@ int main(int argc, const char* argv[])
         const char* path = r.bitstream_upload ? "huffman-blocks"
             : ((r.device_only && r.promote_us == 0 && r.present_us == 0)
                 ? "huffman-floor"
-                : (r.device_only ? "file->VkImage" : "host->VkImage"));
+                : (r.igpu_host ? "igpu->host->VkImage"
+                    : (r.device_only ? "file->VkImage" : "host->VkImage")));
         printLine("{:<22} {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms  {}",
             r.backend,
             r.ready_us / 1000.0,

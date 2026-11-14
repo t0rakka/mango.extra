@@ -72,7 +72,8 @@ MANGO_HYBRID  CPU Huffman → GPU      OpenGL   (roadmap)
 NVJPEG        NVIDIA / CUDA (done)   D3D12    (roadmap)
 ROC           AMD rocJPEG (VK, SDK
               + runtime gate)
-(+ Intel / … later)
+INTEL_VPL     QSV JPEG curiosity
+              (igpu→host→VkImage)
 ```
 
 **Available** = CMake option ON ∩ SDK found at configure ∩ runtime device present.  
@@ -91,6 +92,35 @@ CMake axes (see `CMakeLists.txt`): `GPUJPEG_SOURCE_*`, `GPUJPEG_OUTPUT_*`.
 - Helmet-class results (ballpark): mango READY ~8–10 ms multi-thread CPU; nvJPEG READY ~3 ms; ready-pipe with inflight=4 a bit faster still.
 
 Hybrid nvJPEG moves **s16 DCT coeffs** CPU→GPU then IDCT on device (~2× u8 plane traffic vs final samples). GPU Huffman avoids that expansion on the host bus.
+
+---
+
+## INTEL_VPL path (curiosity)
+
+**Not a primary ingest path.** Discrete-GPU users should use `mango-gpu` / nvJPEG / rocJPEG. This column answers: how fast is Intel’s JPEG engine, and is READY still interesting after the host upload onto a non-Intel Vulkan device.
+
+On a NVIDIA-primary workbench the pixels are born in Intel UMA (system memory). There is no zero-copy Intel→NVIDIA path:
+
+```text
+JPEG file → Intel QSV (iGPU) → map host RGBA → upload → NVIDIA VkImage
+```
+
+Table path string: `igpu→host→VkImage` (same traffic class as mango CPU’s `host→VkImage`).
+
+| Gate | What |
+|------|------|
+| Configure | `GPUJPEG_SOURCE_INTEL_VPL` (default ON). Needs **libvpl** dispatcher (`find_package(VPL)` / `vpl/mfx.h`). |
+| Runtime | Hardware JPEG session must create (`MFX_CODEC_JPEG` + `MFX_IMPL_TYPE_HARDWARE`). Needs **Intel iGPU enabled** + **Intel graphics driver**. |
+
+```bat
+vcpkg install libvpl:x64-windows --classic
+REM BIOS: enable iGPU / multi-monitor. Install Intel UHD/Arc driver until Device Manager shows UHD 7xx.
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake
+cmake --build build
+build\gpujpeg --backend=intel --warmup=2 --iterations=5 photo.jpg
+```
+
+A real on-device Intel `file→VkImage` peer (Vulkan on the same Intel adapter) is out of scope here.
 
 ---
 

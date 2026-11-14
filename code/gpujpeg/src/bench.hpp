@@ -43,6 +43,7 @@ struct PipelineResult
     bool pipeline_overlapped = false;
     bool device_only = false;
     bool bitstream_upload = false; // mango-gpu: packed entropy in a VkBuffer, no pixels yet
+    bool igpu_host = false;        // Intel QSV: igpu→host→VkImage (not on-device)
     bool ok = false;
     std::string error;
 };
@@ -120,7 +121,10 @@ inline void printPipeline(const PipelineResult& r)
         const size_t bytes = r.image.rgba.empty()
             ? size_t(r.image.width) * size_t(r.image.height) * 4
             : r.image.rgba.size();
-        mango::printLine("  path:    host RGBA -> intermediate VkImage");
+        if (r.igpu_host)
+            mango::printLine("  path:    igpu QSV -> host RGBA -> VkImage (curiosity)");
+        else
+            mango::printLine("  path:    host RGBA -> intermediate VkImage");
         mango::printLine("  image:   {} x {} (RGBA8, {} KB)",
             r.image.width, r.image.height, bytes / 1024);
         mango::printLine("  READY:   {:8.2f} ms   <-- VkImage usable", r.ready_us / 1000.0);

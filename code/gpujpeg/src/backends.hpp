@@ -1,7 +1,7 @@
 #pragma once
 
 // Support matrix (workbench → later mango plugin):
-//   Sources:  MANGO | NVJPEG | ROC  (+ Intel later)
+//   Sources:  MANGO | NVJPEG | ROC | INTEL_VPL (curiosity)
 //   Outputs:  VK | GL | D3D11 | D3D12
 // Available = CMake enabled && SDK detected && runtime present.
 
@@ -14,6 +14,7 @@ enum class DecodeSource
     MangoHybrid, // CPU Spectral Huffman → (later) GPU compute
     NvJpeg,
     Roc,
+    IntelVpl,    // QSV JPEG → host → VkImage (curiosity)
     AppleVt,
 };
 
@@ -33,6 +34,7 @@ inline const char* decodeSourceName(DecodeSource s)
         case DecodeSource::MangoHybrid: return "mango-hybrid";
         case DecodeSource::NvJpeg:      return "nvjpeg";
         case DecodeSource::Roc:         return "roc";
+        case DecodeSource::IntelVpl:    return "intel-vpl";
         case DecodeSource::AppleVt:    return "apple-vt";
     }
     return "?";
@@ -80,6 +82,12 @@ inline bool sourceBuilt(DecodeSource s)
 #endif
         case DecodeSource::Roc:
 #if defined(GPUJPEG_HAS_SOURCE_ROC)
+            return true;
+#else
+            return false;
+#endif
+        case DecodeSource::IntelVpl:
+#if defined(GPUJPEG_HAS_SOURCE_INTEL_VPL)
             return true;
 #else
             return false;

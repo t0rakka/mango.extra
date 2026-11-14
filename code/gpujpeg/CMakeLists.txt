@@ -14,6 +14,7 @@ option(GPUJPEG_SOURCE_MANGO        "CPU mango::image decode source"             
 option(GPUJPEG_SOURCE_MANGO_HYBRID "Mango Spectral Huffman → GPU compute (hybrid)"     ON)
 option(GPUJPEG_SOURCE_NVJPEG       "NVIDIA nvJPEG decode source"                       ON)
 option(GPUJPEG_SOURCE_ROC          "AMD rocJPEG decode source (VCN JPEG → HIP)"        ON)
+option(GPUJPEG_SOURCE_INTEL_VPL    "Intel oneVPL/QSV JPEG (curiosity: igpu→host→VkImage)" ON)
 if(APPLE)
     option(GPUJPEG_SOURCE_APPLE_VT "Apple VideoToolbox JPEG → IOSurface → VkImage" ON)
 else()
@@ -44,6 +45,8 @@ add_executable(gpujpeg
     src/mango_gpu_backend.cpp
     src/roc_backend.hpp
     src/roc_backend.cpp
+    src/intel_vpl_backend.hpp
+    src/intel_vpl_backend.cpp
 )
 
 set(_gpujpeg_apple_sources "")
@@ -174,6 +177,64 @@ if (GPUJPEG_SOURCE_ROC)
     endif()
 else()
     message(STATUS "Source ROC: disabled")
+endif()
+
+set(_gpujpeg_has_intel_vpl FALSE)
+if (GPUJPEG_SOURCE_INTEL_VPL)
+    # Dispatcher only (headers + vpl.lib). HW JPEG runtime rides with the Intel
+    # graphics driver once the iGPU is enabled. Prefer CONFIG package from vcpkg.
+    find_package(VPL CONFIG QUIET)
+    if (NOT VPL_FOUND)
+        find_path(VPL_INCLUDE_DIR vpl/mfx.h
+            PATHS
+                "$ENV{VCPKG_ROOT}/installed/x64-windows/include"
+                "${CMAKE_PREFIX_PATH}"
+            PATH_SUFFIXES include)
+        find_library(VPL_LIBRARY NAMES vpl libvpl
+            PATHS
+                "$ENV{VCPKG_ROOT}/installed/x64-windows/lib"
+                "${CMAKE_PREFIX_PATH}"
+            PATH_SUFFIXES lib)
+        if (VPL_INCLUDE_DIR AND VPL_LIBRARY)
+            set(VPL_FOUND TRUE)
+        endif()
+    endif()
+
+    if (VPL_FOUND)
+        set(_gpujpeg_has_intel_vpl TRUE)
+        target_compile_definitions(gpujpeg PRIVATE
+            GPUJPEG_HAS_SOURCE_INTEL_VPL=1
+            GPUJPEG_HAS_INTEL_VPL=1)
+        if (TARGET VPL::dispatcher)
+            target_link_libraries(gpujpeg PRIVATE VPL::dispatcher)
+        elseif (TARGET VPL::api)
+            target_link_libraries(gpujpeg PRIVATE VPL::api)
+        else()
+            target_include_directories(gpujpeg PRIVATE ${VPL_INCLUDE_DIR})
+            target_link_libraries(gpujpeg PRIVATE ${VPL_LIBRARY})
+        endif()
+        if (WIN32)
+            # Dispatcher DLL beside the exe (vcpkg applocal may also copy it).
+            if (DEFINED VCPKG_INSTALLED_DIR)
+                set(_vpl_bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+            elseif (DEFINED ENV{VCPKG_ROOT})
+                set(_vpl_bin "$ENV{VCPKG_ROOT}/installed/x64-windows/bin")
+            endif()
+            if (_vpl_bin AND EXISTS "${_vpl_bin}/vpl.dll")
+                add_custom_command(TARGET gpujpeg POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_vpl_bin}/vpl.dll"
+                        $<TARGET_FILE_DIR:gpujpeg>
+                    COMMENT "Copy libvpl dispatcher DLL beside gpujpeg")
+            endif()
+        endif()
+        message(STATUS "Source INTEL_VPL: enabled (dispatcher; HW needs Intel iGPU+driver)")
+    else()
+        message(STATUS "Source INTEL_VPL: requested but libvpl not found — off")
+        message(STATUS "  install: vcpkg install libvpl:x64-windows --classic")
+    endif()
+else()
+    message(STATUS "Source INTEL_VPL: disabled")
 endif()
 
 # --- Outputs ---
