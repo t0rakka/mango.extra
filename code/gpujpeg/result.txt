@@ -7,7 +7,7 @@ CPU: AMD TR 3990 (64 cores: 128 threads)
 GPU: nVidia GTX 2080ti
 ---------------------------------------------------------------------------------------------------------
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    36.61ms    4.52ms   11.99ms    8.06ms   44.67ms  host->VkImage
@@ -19,7 +19,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    37.16ms    5.45ms   12.06ms    9.48ms   46.64ms  host->VkImage
@@ -31,7 +31,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    71.81ms   40.15ms   12.03ms    7.16ms   78.97ms  host->VkImage
@@ -49,7 +49,7 @@ CPU: Intel i7-14700HX (8 P-cores, 12 E-cores: 28 threads)
 GPU: nVidia RTX 4070
 ---------------------------------------------------------------------------------------------------------
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    24.32ms    9.99ms    6.22ms    3.36ms   27.69ms  host->VkImage
@@ -62,7 +62,7 @@ turbojpeg                35.81ms   29.71ms    6.10ms    0.35ms   36.17ms  host->
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    33.42ms    7.76ms    6.64ms    3.81ms   37.23ms  host->VkImage
@@ -75,7 +75,7 @@ turbojpeg                36.44ms   30.38ms    6.05ms    0.22ms   36.66ms  host->
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    48.52ms   33.23ms    7.37ms    4.07ms   52.60ms  host->VkImage
@@ -94,7 +94,7 @@ CPU: Intel i9-13900K (8 P-cores, 16 E-cores: 32 threads)
 GPU: nVidia RTX 4090
 ---------------------------------------------------------------------------------------------------------
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    14.35ms    2.89ms    3.98ms    2.59ms   16.94ms  host->VkImage
@@ -108,7 +108,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    14.10ms    2.97ms    3.90ms    2.69ms   16.80ms  host->VkImage
@@ -122,7 +122,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    43.32ms   31.55ms    4.60ms    3.00ms   46.32ms  host->VkImage
@@ -144,7 +144,7 @@ GPU: AMD Radeon 9070 XT
 
 NOTE: RADV driver has bug that requires mitigation that kills the mango-gpu backend performance
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    10.74ms    2.60ms    6.05ms    1.01ms   11.75ms  host->VkImage  fastest
@@ -155,7 +155,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    11.03ms    3.19ms    5.71ms    0.84ms   11.87ms  host->VkImage  fastest
@@ -166,7 +166,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    32.44ms   24.65ms    5.57ms    0.97ms   33.41ms  host->VkImage
@@ -186,7 +186,7 @@ GPU: AMD Radeon 9070 XT
 NOTE: The mango-gpu path is OK on Windows driver (RADV Linux driver has bug that kills performance)
 NOTE: ROC is not yet tested on this configuration
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    11.79ms    2.49ms    5.75ms    6.15ms   17.95ms  host->VkImage
@@ -197,7 +197,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    12.94ms    3.00ms    6.18ms    5.41ms   18.35ms  host->VkImage
@@ -208,7 +208,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    35.77ms   26.19ms    5.79ms    6.24ms   42.02ms  host->VkImage  fastest
@@ -225,7 +225,7 @@ CPU: Apple M4 (12 Performance, 4 Efficiency: 16 threads)
 GPU: Apple M4 Max (40 cores)
 ---------------------------------------------------------------------------------------------------------
 
-file: mango1.jpg
+file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    28.39ms    3.66ms   22.51ms    8.38ms   36.76ms  host->VkImage
@@ -237,7 +237,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: rst.jpg
+file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    21.16ms    3.76ms   14.81ms    7.94ms   29.11ms  host->VkImage
@@ -249,7 +249,7 @@ turbojpeg                TODO
 
 >>>>
 
-file: serial.jpg
+file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
 mango                    37.04ms   20.07ms   14.31ms    8.60ms   45.64ms  host->VkImage
