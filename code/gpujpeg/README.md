@@ -74,6 +74,10 @@ ROC           AMD rocJPEG (VK, SDK
               + runtime gate)
 INTEL_VPL     QSV JPEG curiosity
               (igpu→host→VkImage)
+WIC           Windows inbox JPEG
+              (host→VkImage, Windows only)
+TURBOJPEG     libjpeg-turbo (CPU, one
+              thread, host→VkImage)
 ```
 
 **Available** = CMake option ON ∩ SDK found at configure ∩ runtime device present.  
@@ -121,6 +125,30 @@ build\gpujpeg --backend=intel --warmup=2 --iterations=5 photo.jpg
 ```
 
 A real on-device Intel `file→VkImage` peer (Vulkan on the same Intel adapter) is out of scope here.
+
+---
+
+## WIC path (Windows)
+
+Windows Imaging Component inbox JPEG decoder (`CLSID_WICJpegDecoder`). Same traffic class as mango: pixels are born in host memory and uploaded to the VkImage. This is the system-decoder column, the Windows peer of Apple ImageIO, not a hardware ingest path. The inbox codec is single-threaded.
+
+```text
+JPEG file → WIC (windowscodecs) → host RGBA → upload → VkImage
+```
+
+Table path string: `host→VkImage`.
+
+| Gate | What |
+|------|------|
+| Configure | `GPUJPEG_SOURCE_WIC` (default ON on Windows, OFF elsewhere). Links `windowscodecs`. |
+| Runtime | `IWICImagingFactory` (inbox since Windows Vista). |
+
+```bat
+build\gpujpeg.exe --backend=wic --warmup=2 --iterations=5 photo.jpg
+build\gpujpeg.exe --backend=all photo.jpg
+```
+
+`--backend=all` includes `wic` on Windows builds.
 
 ---
 
@@ -188,7 +216,7 @@ build\gpujpeg.exe --backend=nvjpeg --nvjpeg-mode=gpu --inflight=4 --pipeline=32 
 
 | Flag | Meaning |
 |------|---------|
-| `--backend` | `mango` \| `hybrid` \| `nvjpeg` \| `roc` \| `both` \| `all` |
+| `--backend` | `mango` \| `hybrid` \| `gpu` \| `nvjpeg` \| `roc` \| `intel` \| `wic` \| `turbojpeg` \| `apple-vt` \| `apple-imageio` \| `both` \| `all` |
 | `--roc-mode` | `hardware` \| `hybrid` \| `both` (ROC only) |
 | `--hybrid-floor` | Hybrid Huffman-only (no VK compute) |
 | `--nvjpeg-mode` | `hybrid` \| `gpu` \| `both` |

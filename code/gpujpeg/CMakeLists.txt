@@ -15,6 +15,12 @@ option(GPUJPEG_SOURCE_MANGO_HYBRID "Mango Spectral Huffman → GPU compute (hybr
 option(GPUJPEG_SOURCE_NVJPEG       "NVIDIA nvJPEG decode source"                       ON)
 option(GPUJPEG_SOURCE_ROC          "AMD rocJPEG decode source (VCN JPEG → HIP)"        ON)
 option(GPUJPEG_SOURCE_INTEL_VPL    "Intel oneVPL/QSV JPEG (curiosity: igpu→host→VkImage)" ON)
+option(GPUJPEG_SOURCE_TURBOJPEG    "libjpeg-turbo TurboJPEG → host RGBA → VkImage"      ON)
+if(WIN32)
+    option(GPUJPEG_SOURCE_WIC      "Windows Imaging Component JPEG (host RGBA → VkImage)" ON)
+else()
+    option(GPUJPEG_SOURCE_WIC      "Windows Imaging Component JPEG (host RGBA → VkImage)" OFF)
+endif()
 if(APPLE)
     option(GPUJPEG_SOURCE_APPLE_VT "Apple VideoToolbox JPEG → IOSurface → VkImage" ON)
 else()
@@ -47,6 +53,10 @@ add_executable(gpujpeg
     src/roc_backend.cpp
     src/intel_vpl_backend.hpp
     src/intel_vpl_backend.cpp
+    src/wic_backend.hpp
+    src/wic_backend.cpp
+    src/turbojpeg_backend.hpp
+    src/turbojpeg_backend.cpp
 )
 
 set(_gpujpeg_apple_sources "")
@@ -235,6 +245,46 @@ if (GPUJPEG_SOURCE_INTEL_VPL)
     endif()
 else()
     message(STATUS "Source INTEL_VPL: disabled")
+endif()
+
+if (GPUJPEG_SOURCE_WIC)
+    if (WIN32)
+        target_compile_definitions(gpujpeg PRIVATE
+            GPUJPEG_HAS_SOURCE_WIC=1
+            GPUJPEG_HAS_WIC=1)
+        target_link_libraries(gpujpeg PRIVATE windowscodecs ole32)
+        message(STATUS "Source WIC: enabled (Windows Imaging Component)")
+    else()
+        message(STATUS "Source WIC: requested but not on Windows — off")
+    endif()
+else()
+    message(STATUS "Source WIC: disabled")
+endif()
+
+set(_gpujpeg_has_turbojpeg FALSE)
+if (GPUJPEG_SOURCE_TURBOJPEG)
+    find_package(libjpeg-turbo CONFIG QUIET)
+    if (TARGET libjpeg-turbo::turbojpeg)
+        set(_gpujpeg_has_turbojpeg TRUE)
+        target_compile_definitions(gpujpeg PRIVATE
+            GPUJPEG_HAS_SOURCE_TURBOJPEG=1
+            GPUJPEG_HAS_TURBOJPEG=1)
+        target_link_libraries(gpujpeg PRIVATE libjpeg-turbo::turbojpeg)
+        get_target_property(_turbo_type libjpeg-turbo::turbojpeg TYPE)
+        if (_turbo_type STREQUAL "SHARED_LIBRARY")
+            add_custom_command(TARGET gpujpeg POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:libjpeg-turbo::turbojpeg>"
+                    $<TARGET_FILE_DIR:gpujpeg>
+                COMMENT "Copy turbojpeg runtime beside gpujpeg")
+        endif()
+        message(STATUS "Source TURBOJPEG: enabled (${libjpeg-turbo_VERSION})")
+    else()
+        message(STATUS "Source TURBOJPEG: requested but libjpeg-turbo not found — off")
+        message(STATUS "  install: vcpkg install libjpeg-turbo")
+    endif()
+else()
+    message(STATUS "Source TURBOJPEG: disabled")
 endif()
 
 # --- Outputs ---

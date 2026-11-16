@@ -10,6 +10,8 @@
 #include "nvjpeg_backend.hpp"
 #include "roc_backend.hpp"
 #include "intel_vpl_backend.hpp"
+#include "wic_backend.hpp"
+#include "turbojpeg_backend.hpp"
 #if defined(GPUJPEG_HAS_APPLE_VT)
 #include "apple_vt_backend.hpp"
 #include "apple_imageio_backend.hpp"
@@ -48,6 +50,8 @@ enum class Backend
     NvJpeg,
     Roc,
     IntelVpl, // QSV JPEG → host → VkImage (curiosity)
+    Wic,      // Windows Imaging Component → host RGBA → VkImage
+    TurboJpeg,
     AppleVt,
     AppleImageIo,
     Both,    // mango + nvjpeg
@@ -89,9 +93,11 @@ void configureParser(const CommandLine& commands, Args& args)
     commands.usage("[options] <file.jpg>");
 
     commands.option("--backend",
-        "mango | hybrid | gpu | nvjpeg | roc | intel | apple-vt | apple-imageio | both | all (default all)\n"
+        "mango | hybrid | gpu | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
         "         hybrid = Huffman+VK compute; gpu = Mango1/RST/serial entropy -> VkImage;\n"
         "         roc = VCN JPEG; intel = QSV JPEG (igpu→host→VkImage, curiosity);\n"
+        "         wic = Windows Imaging Component JPEG → host RGBA → VkImage;\n"
+        "         turbojpeg = libjpeg-turbo (host RGBA → VkImage);\n"
         "         apple-vt = VideoToolbox;\n"
         "         apple-imageio = ImageIO still JPEG → BGRA IOSurface;\n"
         "         both = mango+nvjpeg; all = every built source",
@@ -109,6 +115,10 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::Roc;
             else if (value == "intel" || value == "intel-vpl" || value == "qsv" || value == "vpl")
                 args.backend = Backend::IntelVpl;
+            else if (value == "wic")
+                args.backend = Backend::Wic;
+            else if (value == "turbo" || value == "turbojpeg" || value == "libjpeg-turbo")
+                args.backend = Backend::TurboJpeg;
             else if (value == "apple-vt" || value == "apple" || value == "vt")
                 args.backend = Backend::AppleVt;
             else if (value == "apple-imageio" || value == "imageio")
@@ -119,7 +129,7 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::All;
             else
                 args.error = fmt::format(
-                    "Invalid --backend \"{}\" (mango|hybrid|gpu|nvjpeg|roc|intel|apple-vt|apple-imageio|both|all)", value);
+                    "Invalid --backend \"{}\" (mango|hybrid|gpu|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
         });
 
     commands.option("--nvjpeg-mode", "hybrid | gpu | both (default both). "
@@ -396,6 +406,8 @@ struct Job
     bool use_gpu = false;
     bool use_roc = false;
     bool use_intel_vpl = false;
+    bool use_wic = false;
+    bool use_turbo = false;
     bool use_apple_vt = false;
     bool use_apple_imageio = false;
     bool hybrid_floor = false; // Huffman-only (skip VK compute)
@@ -404,6 +416,8 @@ struct Job
     NvJpegDecoder* decoder = nullptr;
     RocJpegDecoder* roc = nullptr;
     IntelVplDecoder* intel = nullptr;
+    WicDecoder* wic = nullptr;
+    TurboJpegDecoder* turbo = nullptr;
     MangoGpuDecoder* gpu = nullptr;
 };
 
@@ -767,7 +781,9 @@ public:
 #endif
 
             if (!job.use_hybrid && !job.use_nvjpeg && !job.use_roc
-                && !job.use_apple_vt && !job.use_apple_imageio && pipeline_frames > 0)
+                && !job.use_apple_vt && !job.use_apple_imageio && !job.use_wic
+                && !job.use_turbo
+                && pipeline_frames > 0)
             {
                 auto pipe = runMangoReadyPipeline(job.name);
                 printPipeline(pipe);
@@ -830,6 +846,7 @@ public:
                 results.push_back(std::move(r));
             }
         }
+        std::fflush(stdout);
     }
 
 #if defined(GPUJPEG_HAS_NVJPEG)
@@ -1592,6 +1609,142 @@ public:
             return r;
         }
 
+        if (job.use_wic)
+        {
+            if (!job.wic || !job.wic->ok)
+            {
+                r.error = "WIC decoder missing";
+                return r;
+            }
+
+            host_rgba.resize(texture.rgba_bytes);
+            u64 decode_us = 0;
+            if (!job.wic->decodeToHost(jpeg, host_rgba.data(), host_rgba.size(),
+                    decode_us, error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.decode_us = decode_us;
+            r.image.width = job.wic->width;
+            r.image.height = job.wic->height;
+            r.image.components = 4;
+            addMilestone(r.milestones, "wic_decoded", t0);
+
+            const u64 t_up0 = nowUs();
+            std::memcpy(texture.host_mapped, host_rgba.data(), texture.rgba_bytes);
+            if (!texture.flushCopyHostToImage(graphicsQueue(), graphicsQueueFamilyIndex(), error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.promote_us = nowUs() - t_up0;
+            r.ready_us = nowUs() - t0;
+            addMilestone(r.milestones, "vk_ready", t0);
+
+            const u64 t_pr0 = nowUs();
+            if (!presentSlotFullscreen(texture))
+            {
+                r.error = "present blit failed";
+                return r;
+            }
+            r.present_us = nowUs() - t_pr0;
+            addMilestone(r.milestones, "presented", t0);
+
+            r.e2e_us = nowUs() - t0;
+            r.ok = true;
+            slot.ready = true;
+            printLine("  wic: {}x{} {} decode={:.2f}ms promote={:.2f}ms ready={:.2f}ms",
+                r.image.width, r.image.height, job.wic->codec_name,
+                r.decode_us / 1000.0, r.promote_us / 1000.0, r.ready_us / 1000.0);
+            if (std::getenv("GPUJPEG_CHECK"))
+            {
+                const int delta = checkHybridImage(texture, jpeg,
+                    graphicsQueue(), graphicsQueueFamilyIndex(), error);
+                if (delta < 0)
+                    printLine("  wic check FAILED: {}", error);
+                else
+                    printLine("  wic check: max |wic-mango| = {}", delta);
+            }
+            setTitle(fmt::format("gpujpeg [{}] {}x{} (host→Vk)", job.name,
+                r.image.width, r.image.height));
+            return r;
+        }
+
+        auto publishCpu = [&](const char* milestone, const char* codec, int iw, int ih,
+                              auto&& decode) -> bool
+        {
+            host_rgba.resize(texture.rgba_bytes);
+            u64 decode_us = 0;
+            if (!decode(decode_us))
+            {
+                r.error = error;
+                return false;
+            }
+            r.decode_us = decode_us;
+            r.image.width = iw;
+            r.image.height = ih;
+            r.image.components = 4;
+            addMilestone(r.milestones, milestone, t0);
+
+            const u64 t_up0 = nowUs();
+            std::memcpy(texture.host_mapped, host_rgba.data(), texture.rgba_bytes);
+            if (!texture.flushCopyHostToImage(graphicsQueue(), graphicsQueueFamilyIndex(), error))
+            {
+                r.error = error;
+                return false;
+            }
+            r.promote_us = nowUs() - t_up0;
+            r.ready_us = nowUs() - t0;
+            addMilestone(r.milestones, "vk_ready", t0);
+
+            const u64 t_pr0 = nowUs();
+            if (!presentSlotFullscreen(texture))
+            {
+                r.error = "present blit failed";
+                return false;
+            }
+            r.present_us = nowUs() - t_pr0;
+            addMilestone(r.milestones, "presented", t0);
+
+            r.e2e_us = nowUs() - t0;
+            r.ok = true;
+            slot.ready = true;
+            printLine("  {}: {}x{} {} decode={:.2f}ms promote={:.2f}ms ready={:.2f}ms",
+                job.name, r.image.width, r.image.height, codec,
+                r.decode_us / 1000.0, r.promote_us / 1000.0, r.ready_us / 1000.0);
+            if (std::getenv("GPUJPEG_CHECK"))
+            {
+                const int delta = checkHybridImage(texture, jpeg,
+                    graphicsQueue(), graphicsQueueFamilyIndex(), error);
+                if (delta < 0)
+                    printLine("  {} check FAILED: {}", job.name, error);
+                else
+                    printLine("  {} check: max |dec-mango| = {}", job.name, delta);
+            }
+            setTitle(fmt::format("gpujpeg [{}] {}x{} (host→Vk)", job.name,
+                r.image.width, r.image.height));
+            return true;
+        };
+
+        if (job.use_turbo)
+        {
+            if (!job.turbo || !job.turbo->ok)
+            {
+                r.error = "libjpeg-turbo decoder missing";
+                return r;
+            }
+            if (!publishCpu("turbo_decoded", job.turbo->codec_name.c_str(),
+                    job.turbo->width, job.turbo->height,
+                    [&](u64& us)
+                    {
+                        return job.turbo->decodeToHost(jpeg, host_rgba.data(),
+                            host_rgba.size(), us, error);
+                    }))
+                return r;
+            return r;
+        }
+
         // SIMD decode into cached memory. The staging buffer is write-combined;
         // decoding into it directly is several times slower than one streaming copy.
         u64 decode_us = 0;
@@ -1693,12 +1846,14 @@ int main(int argc, const char* argv[])
 
     printLine(getSystemInfo());
     printLine("Workbench matrix (built):");
-    printLine("  sources: mango={} hybrid={} nvjpeg={} roc={} intel-vpl={}",
+    printLine("  sources: mango={} hybrid={} nvjpeg={} roc={} intel-vpl={} wic={} turbo={}",
         sourceBuilt(DecodeSource::Mango),
         sourceBuilt(DecodeSource::MangoHybrid),
         sourceBuilt(DecodeSource::NvJpeg),
         sourceBuilt(DecodeSource::Roc),
-        sourceBuilt(DecodeSource::IntelVpl));
+        sourceBuilt(DecodeSource::IntelVpl),
+        sourceBuilt(DecodeSource::Wic),
+        sourceBuilt(DecodeSource::TurboJpeg));
     printLine("  outputs: vulkan={} opengl={} d3d11={} d3d12={}",
         outputBuilt(OutputApi::Vulkan),
         outputBuilt(OutputApi::OpenGL),
@@ -1731,6 +1886,20 @@ int main(int argc, const char* argv[])
             printLine("Intel VPL runtime: no ({})", intel_info.error);
         else
             printLine("Intel VPL runtime: no");
+    }
+    {
+        const WicRuntimeInfo wic_info = queryWicRuntime();
+        if (wicAvailable())
+            printLine("WIC runtime: yes (Windows Imaging Component)");
+        else
+            printLine("WIC runtime: no ({})", wic_info.error);
+    }
+    {
+        const TurboJpegRuntimeInfo turbo_info = queryTurboJpegRuntime();
+        if (turboJpegAvailable())
+            printLine("libjpeg-turbo runtime: yes");
+        else
+            printLine("libjpeg-turbo runtime: no ({})", turbo_info.error);
     }
 
     const u64 t_file0 = nowUs();
@@ -1774,6 +1943,12 @@ int main(int argc, const char* argv[])
         args.backend == Backend::All;
     const bool want_intel =
         args.backend == Backend::IntelVpl ||
+        args.backend == Backend::All;
+    const bool want_wic =
+        args.backend == Backend::Wic ||
+        args.backend == Backend::All;
+    const bool want_turbo =
+        args.backend == Backend::TurboJpeg ||
         args.backend == Backend::All;
     const bool want_apple =
         args.backend == Backend::AppleVt ||
@@ -2000,6 +2175,106 @@ int main(int argc, const char* argv[])
         if (args.backend == Backend::IntelVpl)
             return 1;
 #endif
+    }
+
+    std::vector<std::unique_ptr<WicDecoder>> wic_decoders;
+    if (want_wic)
+    {
+        if (!wicAvailable())
+        {
+            const WicRuntimeInfo info = queryWicRuntime();
+            printLine("WIC unavailable ({}).",
+                info.error.empty() ? "Windows only" : info.error);
+            if (args.backend == Backend::Wic)
+                return 1;
+        }
+        else
+        {
+            auto dec = std::make_unique<WicDecoder>();
+            std::string error;
+            if (!dec->init(width, height, error))
+            {
+                printLine("wic init FAILED: {}", error);
+                if (args.backend == Backend::Wic)
+                    return 1;
+            }
+            else
+            {
+                printLine("wic init: {:.2f} ms  ({}, host RGBA → VkImage)",
+                    dec->init_us / 1000.0, dec->codec_name);
+                if (!dec->warmup(jpeg, args.warmup, error))
+                {
+                    printLine("wic warmup FAILED: {}", error);
+                    if (args.backend == Backend::Wic)
+                        return 1;
+                }
+                else
+                {
+                    if (args.warmup > 0)
+                    {
+                        printLine("wic warmup: {:.2f} ms ({} rounds)",
+                            dec->warmup_us / 1000.0, args.warmup);
+                    }
+                    Job job;
+                    job.name = "wic";
+                    job.use_wic = true;
+                    job.wic = dec.get();
+                    jobs.push_back(std::move(job));
+                    wic_decoders.push_back(std::move(dec));
+                }
+            }
+        }
+    }
+
+    auto addHostJpeg = [&](auto decoder, const char* label, auto&& bind)
+    {
+        std::string error;
+        if (!decoder->init(width, height, error))
+        {
+            printLine("{} init FAILED: {}", label, error);
+            return false;
+        }
+        printLine("{} init: {:.2f} ms  ({}, host RGBA → VkImage)",
+            label, decoder->init_us / 1000.0, decoder->codec_name);
+        if (!decoder->warmup(jpeg, args.warmup, error))
+        {
+            printLine("{} warmup FAILED: {}", label, error);
+            return false;
+        }
+        if (args.warmup > 0)
+        {
+            printLine("{} warmup: {:.2f} ms ({} rounds)",
+                label, decoder->warmup_us / 1000.0, args.warmup);
+        }
+        bind(decoder);
+        return true;
+    };
+
+    std::vector<std::unique_ptr<TurboJpegDecoder>> turbo_decoders;
+    if (want_turbo)
+    {
+        if (!turboJpegAvailable())
+        {
+            const TurboJpegRuntimeInfo info = queryTurboJpegRuntime();
+            printLine("libjpeg-turbo unavailable ({}).", info.error);
+            if (args.backend == Backend::TurboJpeg)
+                return 1;
+        }
+        else
+        {
+            auto dec = std::make_unique<TurboJpegDecoder>();
+            TurboJpegDecoder* raw = dec.get();
+            if (!addHostJpeg(raw, "turbojpeg", [&](TurboJpegDecoder*)
+                {
+                    Job job;
+                    job.name = "turbojpeg";
+                    job.use_turbo = true;
+                    job.turbo = raw;
+                    jobs.push_back(std::move(job));
+                    turbo_decoders.push_back(std::move(dec));
+                }) && args.backend == Backend::TurboJpeg)
+                return 1;
+        }
     }
 
 #if defined(GPUJPEG_HAS_APPLE_VT)

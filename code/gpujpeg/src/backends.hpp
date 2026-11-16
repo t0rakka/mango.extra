@@ -1,7 +1,7 @@
 #pragma once
 
 // Support matrix (workbench → later mango plugin):
-//   Sources:  MANGO | NVJPEG | ROC | INTEL_VPL (curiosity)
+//   Sources:  MANGO | NVJPEG | ROC | INTEL_VPL | WIC | TURBOJPEG | APPLE_VT
 //   Outputs:  VK | GL | D3D11 | D3D12
 // Available = CMake enabled && SDK detected && runtime present.
 
@@ -15,6 +15,8 @@ enum class DecodeSource
     NvJpeg,
     Roc,
     IntelVpl,    // QSV JPEG → host → VkImage (curiosity)
+    Wic,         // Windows Imaging Component → host → VkImage
+    TurboJpeg,   // libjpeg-turbo → host → VkImage
     AppleVt,
 };
 
@@ -35,6 +37,8 @@ inline const char* decodeSourceName(DecodeSource s)
         case DecodeSource::NvJpeg:      return "nvjpeg";
         case DecodeSource::Roc:         return "roc";
         case DecodeSource::IntelVpl:    return "intel-vpl";
+        case DecodeSource::Wic:         return "wic";
+        case DecodeSource::TurboJpeg:   return "turbojpeg";
         case DecodeSource::AppleVt:    return "apple-vt";
     }
     return "?";
@@ -88,6 +92,18 @@ inline bool sourceBuilt(DecodeSource s)
 #endif
         case DecodeSource::IntelVpl:
 #if defined(GPUJPEG_HAS_SOURCE_INTEL_VPL)
+            return true;
+#else
+            return false;
+#endif
+        case DecodeSource::Wic:
+#if defined(GPUJPEG_HAS_SOURCE_WIC)
+            return true;
+#else
+            return false;
+#endif
+        case DecodeSource::TurboJpeg:
+#if defined(GPUJPEG_HAS_SOURCE_TURBOJPEG)
             return true;
 #else
             return false;
