@@ -62,6 +62,7 @@ enum class NvJpegModeSelect
 {
     Hybrid,
     Gpu,
+    Hardware,
     Both,
 };
 
@@ -132,18 +133,20 @@ void configureParser(const CommandLine& commands, Args& args)
                     "Invalid --backend \"{}\" (mango|hybrid|gpu|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
         });
 
-    commands.option("--nvjpeg-mode", "hybrid | gpu | both (default both). "
-        "hybrid=CPU Huffman, gpu=GPU-assisted Huffman",
+    commands.option("--nvjpeg-mode", "hybrid | gpu | hardware | both (default both). "
+        "hybrid=CPU Huffman, gpu=CUDA Huffman, hardware=JPEG ASIC. both tries all three",
         [&](std::string_view value)
         {
             if (value == "hybrid")
                 args.nvjpeg_mode = NvJpegModeSelect::Hybrid;
             else if (value == "gpu")
                 args.nvjpeg_mode = NvJpegModeSelect::Gpu;
+            else if (value == "hardware")
+                args.nvjpeg_mode = NvJpegModeSelect::Hardware;
             else if (value == "both")
                 args.nvjpeg_mode = NvJpegModeSelect::Both;
             else
-                args.error = fmt::format("Invalid --nvjpeg-mode \"{}\" (hybrid|gpu|both)", value);
+                args.error = fmt::format("Invalid --nvjpeg-mode \"{}\" (hybrid|gpu|hardware|both)", value);
         });
 
     commands.option("--roc-mode", "hardware | hybrid | both (default both). "
@@ -2093,6 +2096,8 @@ int main(int argc, const char* argv[])
                 addNv(NvJpegMode::Hybrid);
             if (args.nvjpeg_mode == NvJpegModeSelect::Gpu || args.nvjpeg_mode == NvJpegModeSelect::Both)
                 addNv(NvJpegMode::Gpu);
+            if (args.nvjpeg_mode == NvJpegModeSelect::Hardware || args.nvjpeg_mode == NvJpegModeSelect::Both)
+                addNv(NvJpegMode::Hardware);
         }
     }
 

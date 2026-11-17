@@ -8,20 +8,23 @@ namespace gpujpeg
 {
 
 // nvJPEG backends (nvjpeg.h):
-//   Hybrid = NVJPEG_BACKEND_HYBRID     — Huffman on CPU ("some on GPU")
-//   Gpu    = NVJPEG_BACKEND_GPU_HYBRID — GPU-assisted Huffman ("more/all on GPU")
+//   Hybrid   = NVJPEG_BACKEND_HYBRID     — Huffman on CPU ("some on GPU")
+//   Gpu      = NVJPEG_BACKEND_GPU_HYBRID — GPU-assisted Huffman (CUDA)
+//   Hardware = NVJPEG_BACKEND_HARDWARE   — fixed-function JPEG engine
 enum class NvJpegMode
 {
     Hybrid,
     Gpu,
+    Hardware,
 };
 
 inline const char* nvJpegModeName(NvJpegMode mode)
 {
     switch (mode)
     {
-        case NvJpegMode::Hybrid: return "hybrid";
-        case NvJpegMode::Gpu:    return "gpu";
+        case NvJpegMode::Hybrid:   return "hybrid";
+        case NvJpegMode::Gpu:      return "gpu";
+        case NvJpegMode::Hardware: return "hardware";
     }
     return "?";
 }

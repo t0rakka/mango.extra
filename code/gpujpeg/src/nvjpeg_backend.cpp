@@ -134,8 +134,9 @@ nvjpegBackend_t toNvBackend(NvJpegMode mode)
 {
     switch (mode)
     {
-        case NvJpegMode::Hybrid: return NVJPEG_BACKEND_HYBRID;
-        case NvJpegMode::Gpu:    return NVJPEG_BACKEND_GPU_HYBRID;
+        case NvJpegMode::Hybrid:   return NVJPEG_BACKEND_HYBRID;
+        case NvJpegMode::Gpu:      return NVJPEG_BACKEND_GPU_HYBRID;
+        case NvJpegMode::Hardware: return NVJPEG_BACKEND_HARDWARE;
     }
     return NVJPEG_BACKEND_HYBRID;
 }
