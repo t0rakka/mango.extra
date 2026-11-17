@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#include <mango/core/thread.hpp>
 #include <mango/vulkan/compiler.hpp>
 
 namespace gpujpeg
@@ -727,8 +728,8 @@ void putCoeff(uint dst, uint n, int v)
 
 void main()
 {
-    uint mcu = gl_GlobalInvocationID.x;
-    if (int(mcu) >= pc.segCount)
+    uint mcu = uint(pc.waveBase) + gl_GlobalInvocationID.x;
+    if (int(mcu) >= pc.waveBase + pc.segCount)
         return;
 
     Ix ix = ixs[mcu];
@@ -942,7 +943,8 @@ void main()
     {
         mcu_local = block_slot / pc.blocks_in_mcu;
         b = block_slot - mcu_local * pc.blocks_in_mcu;
-        live = (group_mcu0 + mcu_local) < mcu_limit;
+        // group_mcu0 is local to this dispatch. mcu_limit is an absolute MCU index.
+        live = (group_mcu0 + mcu_local) < pc.mcu_rows * pc.xmcu;
     }
 
     if (live)
@@ -1279,17 +1281,18 @@ bool cpuBlock(CpuBit& r, const TablesFlat& tb, int dc_ti, int ac_ti, int& pred)
     return true;
 }
 
-bool buildCursors(const mango::image::jpeg::EntropyStream& stream, std::vector<McuCursor>& cursors,
-    std::string& error)
+// on_batch(begin, end) runs after each row-aligned group, and once for the tail.
+// The cursors in [begin, end) are complete. Return false to stop the scan.
+template <typename OnBatch>
+bool buildCursors(const mango::image::jpeg::EntropyStream& stream, McuCursor* cursors,
+    int batch_mcus, OnBatch&& on_batch, std::string& error)
 {
-    cursors.clear();
     const int total = stream.xmcu * stream.ymcu;
-    if (total <= 0)
+    if (total <= 0 || !cursors)
     {
         error = "MCU grid is empty";
         return false;
     }
-    cursors.resize(std::size_t(total));
 
     TablesFlat flat = {};
     for (int i = 0; i < 128; ++i)
@@ -1313,6 +1316,10 @@ bool buildCursors(const mango::image::jpeg::EntropyStream& stream, std::vector<M
         std::memcpy(flat.lut + index * 256, built.lut, sizeof(built.lut));
         std::memcpy(flat.vals + index * 256, built.vals, sizeof(built.vals));
     }
+
+    int batch_start = 0;
+    if (batch_mcus < 1)
+        batch_mcus = total;
 
     int dc_ti[10] = {};
     int ac_ti[10] = {};
@@ -1351,7 +1358,7 @@ bool buildCursors(const mango::image::jpeg::EntropyStream& stream, std::vector<M
                 error = "MCU cursor is outside the grid";
                 return false;
             }
-            McuCursor& cur = cursors[std::size_t(slot)];
+            McuCursor& cur = cursors[slot];
             cur.pos = std::uint32_t(seg.packed_offset) + r.pos;
             cur.nbits = r.nbits;
             cur.buf = r.buf;
@@ -1366,6 +1373,13 @@ bool buildCursors(const mango::image::jpeg::EntropyStream& stream, std::vector<M
                     error = "Huffman run left the block";
                     return false;
                 }
+            }
+            const int done = slot + 1;
+            if (done == total || done % batch_mcus == 0)
+            {
+                if (!on_batch(batch_start, done))
+                    return false;
+                batch_start = done;
             }
         }
     }
@@ -1423,7 +1437,7 @@ bool MangoGpuDecoder::upload(mango::vulkan::Allocator& allocator, std::string& e
     const VkDeviceSize bit_bytes = (payload + 16u + 3u) & ~VkDeviceSize(3);
     bits = allocator.createBuffer(
         bit_bytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         mango::vulkan::MemoryUsage::Upload,
         true);
     if (!bits || !bits.mapped)
@@ -1447,8 +1461,99 @@ bool MangoGpuDecoder::upload(mango::vulkan::Allocator& allocator, std::string& e
     if (bit_bytes > payload)
         std::memset(dst + payload, 0, std::size_t(bit_bytes - payload));
     allocator.flush(bits.allocation, 0, bit_bytes);
+    m_bit_bytes = bit_bytes;
     upload_us = nowUs() - t0;
     uploaded = true;
+    return true;
+}
+
+bool MangoGpuDecoder::beginEntropyCopy(mango::vulkan::VulkanWindow& window,
+    mango::vulkan::Allocator& allocator, std::string& error)
+{
+    if (!bits || m_bit_bytes == 0)
+    {
+        error = "entropy staging buffer is empty";
+        return false;
+    }
+    if (!m_bits_dev)
+    {
+        m_bits_dev = allocator.createBuffer(m_bit_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            mango::vulkan::MemoryUsage::GpuOnly, false);
+        if (!m_bits_dev)
+        {
+            error = "entropy device buffer failed";
+            return false;
+        }
+        VkCommandPoolCreateInfo pool_ci = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = window.graphicsQueueFamilyIndex(),
+        };
+        if (vkCreateCommandPool(m_device, &pool_ci, nullptr, &m_xfer_pool) != VK_SUCCESS)
+        {
+            error = "entropy copy command pool failed";
+            return false;
+        }
+        VkCommandBufferAllocateInfo cmd_ai = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = m_xfer_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        if (vkAllocateCommandBuffers(m_device, &cmd_ai, &m_xfer_cmd) != VK_SUCCESS)
+        {
+            error = "entropy copy command buffer failed";
+            return false;
+        }
+        VkFenceCreateInfo fence_ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (vkCreateFence(m_device, &fence_ci, nullptr, &m_xfer_fence) != VK_SUCCESS)
+        {
+            error = "entropy copy fence failed";
+            return false;
+        }
+    }
+
+    vkResetFences(m_device, 1, &m_xfer_fence);
+    vkResetCommandBuffer(m_xfer_cmd, 0);
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(m_xfer_cmd, &begin);
+    VkMemoryBarrier host = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(m_xfer_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &host, 0, nullptr, 0, nullptr);
+    VkBufferCopy region = { 0, 0, m_bit_bytes };
+    vkCmdCopyBuffer(m_xfer_cmd, bits.buffer, m_bits_dev.buffer, 1, &region);
+    vkEndCommandBuffer(m_xfer_cmd);
+
+    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &m_xfer_cmd;
+    if (vkQueueSubmit(m_queue, 1, &submit, m_xfer_fence) != VK_SUCCESS)
+    {
+        error = "entropy copy submit failed";
+        return false;
+    }
+    return true;
+}
+
+bool MangoGpuDecoder::waitEntropyCopy(std::string& error)
+{
+    const mango::u64 t0 = nowUs();
+    const VkResult wr = vkWaitForFences(m_device, 1, &m_xfer_fence, VK_TRUE,
+        20ull * 1000ull * 1000ull * 1000ull);
+    xfer_wait_us = nowUs() - t0;
+    if (wr != VK_SUCCESS)
+    {
+        error = wr == VK_TIMEOUT ? "entropy copy timed out" : "entropy copy wait failed";
+        return false;
+    }
     return true;
 }
 
@@ -1461,6 +1566,7 @@ void MangoGpuDecoder::release(mango::vulkan::Allocator& allocator)
         buf = {};
     };
     drop(bits);
+    drop(m_bits_dev);
     drop(m_segs);
     drop(m_tables);
     drop(m_coeffs);
@@ -1494,6 +1600,19 @@ void MangoGpuDecoder::release(mango::vulkan::Allocator& allocator)
             vkDestroyCommandPool(m_device, m_pool, nullptr);
         if (m_fence)
             vkDestroyFence(m_device, m_fence, nullptr);
+        if (m_xfer_pool)
+            vkDestroyCommandPool(m_device, m_xfer_pool, nullptr);
+        if (m_xfer_fence)
+            vkDestroyFence(m_device, m_xfer_fence, nullptr);
+        for (int i = 0; i < kBatchRing; ++i)
+        {
+            if (m_batch_fence[i])
+                vkDestroyFence(m_device, m_batch_fence[i], nullptr);
+            m_batch_fence[i] = VK_NULL_HANDLE;
+            m_batch_cmd[i] = VK_NULL_HANDLE;
+            m_batch_pending[i] = false;
+        }
+        m_batch_ring = false;
     }
 
     m_pipe = VK_NULL_HANDLE;
@@ -1511,10 +1630,305 @@ void MangoGpuDecoder::release(mango::vulkan::Allocator& allocator)
     m_pool = VK_NULL_HANDLE;
     m_cmd = VK_NULL_HANDLE;
     m_fence = VK_NULL_HANDLE;
+    m_xfer_pool = VK_NULL_HANDLE;
+    m_xfer_cmd = VK_NULL_HANDLE;
+    m_xfer_fence = VK_NULL_HANDLE;
+    m_bit_bytes = 0;
     m_device = VK_NULL_HANDLE;
     m_queue = VK_NULL_HANDLE;
     m_pipeline = false;
     uploaded = false;
+}
+
+bool MangoGpuDecoder::runIndexProgressive(mango::vulkan::VulkanWindow& window,
+    mango::vulkan::Allocator& allocator, DecodedTexture& texture, std::string& error)
+{
+    (void)window;
+    if (!m_segs.mapped || !m_pipe || !m_idct_pipe || !m_pool)
+    {
+        error = "index pipeline is not ready";
+        return false;
+    }
+    if (stream.xmcu <= 0 || stream.ymcu <= 0)
+    {
+        error = "MCU grid is empty";
+        return false;
+    }
+
+    if (!m_batch_ring)
+    {
+        VkCommandBufferAllocateInfo cmd_ai = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = m_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = kBatchRing,
+        };
+        if (vkAllocateCommandBuffers(m_device, &cmd_ai, m_batch_cmd) != VK_SUCCESS)
+        {
+            error = "index batch command buffers failed";
+            return false;
+        }
+        for (int i = 0; i < kBatchRing; ++i)
+        {
+            VkFenceCreateInfo fence_ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (vkCreateFence(m_device, &fence_ci, nullptr, &m_batch_fence[i]) != VK_SUCCESS)
+            {
+                error = "index batch fence failed";
+                return false;
+            }
+        }
+        m_batch_ring = true;
+    }
+
+    mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
+    const mango::image::jpeg::JpegInfo& info = info_decoder.info();
+    IdctPush idct = {};
+    idct.width = info.width;
+    idct.height = info.height;
+    idct.xmcu = info.xmcu;
+    idct.xblock = info.xblock;
+    idct.yblock = info.yblock;
+    idct.blocks_in_mcu = info.blocks_in_mcu;
+    idct.components = info.components;
+    int off = 0;
+    auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
+    {
+        if (idx >= info.components)
+        {
+            hsf = vsf = 1;
+            qt = 0;
+            o = 0;
+            return;
+        }
+        hsf = info.component[idx].hsf;
+        vsf = info.component[idx].vsf;
+        qt = info.component[idx].qt;
+        o = off;
+        off += hsf * vsf;
+    };
+    setComp(0, idct.y_hsf, idct.y_vsf, idct.y_qt, idct.y_off);
+    setComp(1, idct.cb_hsf, idct.cb_vsf, idct.cb_qt, idct.cb_off);
+    setComp(2, idct.cr_hsf, idct.cr_vsf, idct.cr_qt, idct.cr_off);
+    const int slots = 32;
+    const int bpm = std::max(info.blocks_in_mcu, 1);
+    idct.mcus_per_group = std::max(slots / bpm, 1);
+
+    PushData push = {};
+    push.xmcu = stream.xmcu;
+    push.blocks = stream.blocks_in_mcu;
+    push.chunkBytes = int(std::min<std::uint64_t>(stream.packed_bytes, 0x7fffffffull));
+    const std::uint64_t coeff_limit = std::uint64_t(stream.ymcu) * std::uint64_t(stream.xmcu)
+        * std::uint64_t(std::max(stream.blocks_in_mcu, 0)) * 64ull;
+    push.coeffLimit = std::int32_t(std::min<std::uint64_t>(coeff_limit, 0x7fffffffull));
+    for (int b = 0; b < stream.blocks_in_mcu; ++b)
+    {
+        const auto& block = stream.block[b];
+        push.pack[b] = std::uint32_t(block.dc)
+            | (std::uint32_t(4 + block.ac) << 8)
+            | (std::uint32_t(block.component) << 16);
+    }
+
+    // 16 MCU rows: the GPU starts while most of the scan is still ahead, and the
+    // tail after the scan is one batch of Huffman + IDCT.
+    constexpr int kBatchRows = 16;
+    const int batch_mcus = stream.xmcu * kBatchRows;
+    index_batches = 0;
+    huffman_us = 0;
+    resolve_us = 0;
+    sync_rounds = -1;
+    sync_chunks = 0;
+
+    bool image_general = false;
+    bool copy_waited = false;
+    int slot = 0;
+    const VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+
+    auto wait_slot = [&](int s, bool count_stall) -> bool
+    {
+        if (!m_batch_pending[s])
+            return true;
+        const mango::u64 t = nowUs();
+        const VkResult wr = vkWaitForFences(m_device, 1, &m_batch_fence[s], VK_TRUE,
+            20ull * 1000ull * 1000ull * 1000ull);
+        if (count_stall)
+            huffman_us += nowUs() - t;
+        m_batch_pending[s] = false;
+        if (wr != VK_SUCCESS)
+        {
+            error = wr == VK_TIMEOUT ? "index batch timed out" : "index batch wait failed";
+            return false;
+        }
+        return true;
+    };
+
+    auto submit = [&](int batch_begin, int batch_end) -> bool
+    {
+        if (!copy_waited)
+        {
+            if (!waitEntropyCopy(error))
+                return false;
+            copy_waited = true;
+        }
+        const int count = batch_end - batch_begin;
+        if (count <= 0)
+            return true;
+        if (!wait_slot(slot, true))
+            return false;
+
+        // The scanner already wrote this range into the one cursor buffer.
+        allocator.flush(m_segs.allocation,
+            VkDeviceSize(batch_begin) * sizeof(McuCursor),
+            VkDeviceSize(count) * sizeof(McuCursor));
+
+        VkCommandBuffer cmd = m_batch_cmd[slot];
+        vkResetFences(m_device, 1, &m_batch_fence[slot]);
+        vkResetCommandBuffer(cmd, 0);
+        vkBeginCommandBuffer(cmd, &begin);
+
+        VkMemoryBarrier host = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &host, 0, nullptr, 0, nullptr);
+
+        push.waveBase = batch_begin;
+        push.segCount = count;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
+            0, 1, &m_set, 0, nullptr);
+        vkCmdPushConstants(cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        const uint32_t groups = (uint32_t(count) + 63u) / 64u;
+        vkCmdDispatch(cmd, std::max(groups, 1u), 1, 1);
+
+        VkMemoryBarrier coeffs = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
+        VkImageLayout old_layout = VK_IMAGE_LAYOUT_GENERAL;
+        if (!image_general)
+        {
+            old_layout = texture.layout;
+            src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            src_access = 0;
+            if (texture.layout != VK_IMAGE_LAYOUT_UNDEFINED)
+            {
+                src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                    | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                src_access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT
+                    | VK_ACCESS_SHADER_WRITE_BIT;
+            }
+        }
+        VkImageMemoryBarrier to_general = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = src_access,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = old_layout,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = texture.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(cmd,
+            src_stage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &coeffs, 0, nullptr, 1, &to_general);
+
+        idct.mcu_y0 = batch_begin / stream.xmcu;
+        idct.mcu_rows = count / stream.xmcu;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_idct_pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_idct_pipe_layout,
+            0, 1, &m_idct_set, 0, nullptr);
+        vkCmdPushConstants(cmd, m_idct_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(idct), &idct);
+        const uint32_t idct_groups = (uint32_t(count) + uint32_t(std::max(idct.mcus_per_group, 1)) - 1u)
+            / uint32_t(std::max(idct.mcus_per_group, 1));
+        vkCmdDispatch(cmd, std::max(idct_groups, 1u), 1, 1);
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo submit_info = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(m_queue, 1, &submit_info, m_batch_fence[slot]) != VK_SUCCESS)
+        {
+            error = "index batch submit failed";
+            return false;
+        }
+        m_batch_pending[slot] = true;
+        image_general = true;
+        slot = (slot + 1) % kBatchRing;
+        ++index_batches;
+        return true;
+    };
+
+    auto drain = [&]() -> bool
+    {
+        for (int i = 0; i < kBatchRing; ++i)
+        {
+            if (!wait_slot(i, false))
+                return false;
+        }
+        return true;
+    };
+
+    // Serial, not concurrent: the uploads share one VkQueue and must stay in order.
+    // The scanner only enqueues. Fence waits stay on this thread.
+    mango::SerialQueue uploads("index-upload");
+    bool upload_failed = false;
+    auto* cursor_table = static_cast<McuCursor*>(m_segs.mapped);
+
+    const mango::u64 t_index = nowUs();
+    const bool scanned = buildCursors(stream, cursor_table, batch_mcus,
+        [&](int batch_begin, int batch_end)
+        {
+            uploads.enqueue([&, batch_begin, batch_end]
+            {
+                if (!submit(batch_begin, batch_end))
+                    upload_failed = true;
+            });
+            return true;
+        }, error);
+    index_us = nowUs() - t_index;
+    index_mcus = stream.xmcu * stream.ymcu;
+    if (!scanned)
+    {
+        uploads.wait();
+        drain();
+        return false;
+    }
+
+    const mango::u64 t_tail = nowUs();
+    uploads.wait();
+    if (upload_failed)
+    {
+        drain();
+        if (error.empty())
+            error = "index upload failed";
+        return false;
+    }
+    if (!drain())
+        return false;
+
+    vkResetCommandBuffer(m_cmd, 0);
+    vkBeginCommandBuffer(m_cmd, &begin);
+    texture.recordPublishComputeStores(m_cmd);
+    vkEndCommandBuffer(m_cmd);
+    if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
+        return false;
+    resolve_us = nowUs() - t_tail;
+    texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    std::printf("mango-gpu: index progressive %d batches\n", index_batches);
+    std::fflush(stdout);
+    return true;
 }
 
 bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
@@ -1538,14 +1952,9 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
     }
 
     index_us = 0;
-    if (index_mode)
-    {
-        const mango::u64 t_index = nowUs();
-        if (!buildCursors(stream, cursors, error))
-            return false;
-        index_us = nowUs() - t_index;
-        index_mcus = int(cursors.size());
-    }
+    xfer_wait_us = 0;
+    if (index_mode && !beginEntropyCopy(window, allocator, error))
+        return false;
 
     if (!m_pipeline)
     {
@@ -1640,7 +2049,8 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
 
         if (index_mode)
         {
-            const VkDeviceSize bytes = VkDeviceSize(cursors.size()) * sizeof(McuCursor);
+            const int cursor_mcus = std::max(stream.xmcu, 0) * std::max(stream.ymcu, 0);
+            const VkDeviceSize bytes = VkDeviceSize(cursor_mcus) * sizeof(McuCursor);
             m_segs = allocator.createBuffer(std::max(bytes, VkDeviceSize(sizeof(McuCursor))),
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
             if (!m_segs || !m_segs.mapped)
@@ -1777,7 +2187,7 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
             return info;
         };
         VkDescriptorBufferInfo infos[5] = {
-            write(bits.buffer),
+            write(index_mode ? m_bits_dev.buffer : bits.buffer),
             write(m_segs.buffer),
             write(m_tables.buffer),
             write(m_coeffs.buffer),
@@ -1957,19 +2367,8 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
     uint32_t groups = uint32_t(stream.segments.size());
     push.waveBase = 0;
     if (index_mode)
-    {
-        push.segCount = int(cursors.size());
-        push.chunkBytes = int(std::min<std::uint64_t>(stream.packed_bytes, 0x7fffffffull));
-        sync_chunks = 0;
-        groups = uint32_t((cursors.size() + 63u) / 64u);
-        std::memcpy(m_segs.mapped, cursors.data(), cursors.size() * sizeof(McuCursor));
-        allocator.flush(m_segs.allocation, 0, cursors.size() * sizeof(McuCursor));
-        std::printf("mango-gpu: index dispatch %u MCUs\n", uint32_t(cursors.size()));
-    }
-    else
-    {
-        std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
-    }
+        return runIndexProgressive(window, allocator, texture, error);
+    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
     std::fflush(stdout);
 
     VkCommandBufferBeginInfo begin = {
@@ -1977,16 +2376,22 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
+    if (index_mode && !waitEntropyCopy(error))
+        return false;
+
     const mango::u64 t0 = nowUs();
     vkResetCommandBuffer(m_cmd, 0);
     vkBeginCommandBuffer(m_cmd, &begin);
 
     VkMemoryBarrier host = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT
+            | (index_mode ? VK_ACCESS_TRANSFER_WRITE_BIT : 0u),
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
     };
-    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    const VkPipelineStageFlags entropy_src = VK_PIPELINE_STAGE_HOST_BIT
+        | (index_mode ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0u);
+    vkCmdPipelineBarrier(m_cmd, entropy_src, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &host, 0, nullptr, 0, nullptr);
 
     vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);

@@ -24,9 +24,10 @@ struct DecodedTexture;
 // rows. Huffman inside a segment is serial (DC predictors chain across those
 // rows). IDCT is one work item per MCU once the segment's blocks exist.
 //
-// index_mode is the naive boundary scan: the CPU records a bit cursor and the
-// DC predictors at every MCU, then one GPU thread decodes that MCU. No overlap
-// with the upload. Serial scans are the point; restart segments work the same.
+// index_mode scans MCU cursors on the CPU. Finished rows are submitted in
+// batches so Huffman and IDCT for that range run while the scan continues.
+// The packed entropy copy starts before the scan. Restart segments use the
+// same stitched cursor space.
 struct McuCursor
 {
     std::uint32_t pos = 0;
@@ -47,12 +48,14 @@ public:
     mango::u64 upload_us = 0;
     mango::u64 compile_us = 0;
     mango::u64 index_us = 0;   // CPU boundary scan (index_mode only)
+    mango::u64 xfer_wait_us = 0; // residual wait for the entropy copy after the scan
     mango::u64 huffman_us = 0;
     mango::u64 resolve_us = 0; // IDCT + YCbCr → texture
     mango::u64 compile_last_us = 0; // non-zero only on the call that compiled
     int sync_rounds = -1; // longest self-sync wavefront inside a segment
     int sync_chunks = 0;
     int index_mcus = 0;
+    int index_batches = 0;
     bool index_mode = false;
     bool uploaded = false;
     std::vector<McuCursor> cursors;
@@ -73,10 +76,27 @@ public:
     MangoGpuDecoder& operator=(const MangoGpuDecoder&) = delete;
 
 private:
+    bool beginEntropyCopy(mango::vulkan::VulkanWindow& window,
+        mango::vulkan::Allocator& allocator, std::string& error);
+    bool waitEntropyCopy(std::string& error);
+    bool runIndexProgressive(mango::vulkan::VulkanWindow& window,
+        mango::vulkan::Allocator& allocator, DecodedTexture& texture, std::string& error);
+
     mango::ConstMemory m_jpeg;
     bool m_pipeline = false;
+    VkDeviceSize m_bit_bytes = 0;
 
     VkDevice m_device = VK_NULL_HANDLE;
+    VkCommandPool m_xfer_pool = VK_NULL_HANDLE;
+    VkCommandBuffer m_xfer_cmd = VK_NULL_HANDLE;
+    VkFence m_xfer_fence = VK_NULL_HANDLE;
+    mango::vulkan::BufferAllocation m_bits_dev;
+
+    static constexpr int kBatchRing = 4;
+    VkCommandBuffer m_batch_cmd[kBatchRing] = {};
+    VkFence m_batch_fence[kBatchRing] = {};
+    bool m_batch_pending[kBatchRing] = {};
+    bool m_batch_ring = false;
     VkQueue m_queue = VK_NULL_HANDLE;
     VkCommandPool m_pool = VK_NULL_HANDLE;
     VkCommandBuffer m_cmd = VK_NULL_HANDLE;

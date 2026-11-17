@@ -1165,9 +1165,11 @@ public:
             addMilestone(r.milestones, "vk_ready", t0);
             if (job.gpu->index_mode)
             {
-                printLine("  gpu: index {:.2f} ms ({} MCUs), huffman {:.2f} ms, idct {:.2f} ms{}",
+                printLine("  gpu: index {:.2f} ms ({} MCUs, {} batches), xfer wait {:.2f} ms, upload stall {:.2f} ms, gpu tail {:.2f} ms{}",
                     job.gpu->index_us / 1000.0,
                     job.gpu->index_mcus,
+                    job.gpu->index_batches,
+                    job.gpu->xfer_wait_us / 1000.0,
                     job.gpu->huffman_us / 1000.0,
                     job.gpu->resolve_us / 1000.0,
                     job.gpu->compile_last_us
