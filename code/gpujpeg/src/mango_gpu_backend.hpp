@@ -4,6 +4,9 @@
 
 #include "bench.hpp"
 
+#include <cstdint>
+#include <vector>
+
 #include <mango/image/jpeg.hpp>
 #include <mango/vulkan/vulkan.hpp>
 
@@ -20,6 +23,21 @@ struct DecodedTexture;
 // Dispatch shape (CPU decides, GPU runs): one segment is rows_per_segment MCU
 // rows. Huffman inside a segment is serial (DC predictors chain across those
 // rows). IDCT is one work item per MCU once the segment's blocks exist.
+//
+// index_mode is the naive boundary scan: the CPU records a bit cursor and the
+// DC predictors at every MCU, then one GPU thread decodes that MCU. No overlap
+// with the upload. Serial scans are the point; restart segments work the same.
+struct McuCursor
+{
+    std::uint32_t pos = 0;
+    std::uint32_t nbits = 0;
+    std::uint32_t buf = 0;
+    std::int32_t p0 = 0;
+    std::int32_t p1 = 0;
+    std::int32_t p2 = 0;
+    std::int32_t p3 = 0;
+};
+
 class MangoGpuDecoder
 {
 public:
@@ -28,12 +46,16 @@ public:
     mango::u64 extract_us = 0;
     mango::u64 upload_us = 0;
     mango::u64 compile_us = 0;
+    mango::u64 index_us = 0;   // CPU boundary scan (index_mode only)
     mango::u64 huffman_us = 0;
     mango::u64 resolve_us = 0; // IDCT + YCbCr → texture
     mango::u64 compile_last_us = 0; // non-zero only on the call that compiled
     int sync_rounds = -1; // longest self-sync wavefront inside a segment
     int sync_chunks = 0;
+    int index_mcus = 0;
+    bool index_mode = false;
     bool uploaded = false;
+    std::vector<McuCursor> cursors;
 
     bool extract(mango::ConstMemory jpeg, std::string& error);
     bool upload(mango::vulkan::Allocator& allocator, std::string& error);

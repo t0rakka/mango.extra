@@ -74,6 +74,7 @@ struct CarryGpu
     std::uint32_t pad;
 };
 static_assert(sizeof(CarryGpu) == 48, "CarryGpu must match the Huffman shader");
+static_assert(sizeof(McuCursor) == 28, "McuCursor must match the index shader");
 
 // Must match layout(local_size_x) in the Huffman shader.
 constexpr std::uint32_t kSyncLanes = 64;
@@ -584,6 +585,230 @@ void main()
 }
 )glsl";
 
+// One thread per MCU. The CPU already found the bit cursor and the DC predictors.
+constexpr char kIndexHuffmanSource[] = R"glsl(
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Bits { uint bits[]; };
+struct Ix {
+    uint pos;
+    uint nbits;
+    uint buf;
+    int p0;
+    int p1;
+    int p2;
+    int p3;
+};
+layout(std430, set = 0, binding = 1) readonly buffer Ixs { Ix ixs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Tables {
+    int mincode[128];
+    int maxcode[128];
+    int valptr[128];
+    uint lut[2048];
+    uint vals[2048];
+} tb;
+layout(std430, set = 0, binding = 3) writeonly buffer Coeffs { int coeffs[]; };
+layout(std430, set = 0, binding = 4) buffer Stats { uint unused[]; };
+
+layout(push_constant) uniform Push {
+    int xmcu;
+    int blocks;
+    int segCount;
+    int chunkBytes;
+    int waveBase;
+    int coeffLimit;
+    uint pack[10];
+} pc;
+
+struct Reader {
+    uint pos;
+    uint endp;
+    uint buf;
+    uint nbits;
+};
+
+uint loadByte(uint i)
+{
+    uint w = bits[i >> 2];
+    return (w >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+uint pullByte(inout Reader r)
+{
+    if (r.pos >= r.endp)
+        return 0u;
+    uint b = loadByte(r.pos);
+    r.pos++;
+    if (b == 0xffu)
+    {
+        if (r.pos < r.endp && loadByte(r.pos) == 0u)
+            r.pos++;
+        else
+            r.pos = r.endp;
+    }
+    return b;
+}
+
+void fill(inout Reader r, uint need)
+{
+    while (r.nbits < need && r.pos < r.endp)
+    {
+        r.buf = (r.buf << 8) | pullByte(r);
+        r.nbits += 8u;
+    }
+}
+
+uint getBits(inout Reader r, uint n)
+{
+    if (n >= 32u)
+        return 0u;
+    fill(r, n);
+    if (r.nbits < n)
+        return 0u;
+    r.nbits -= n;
+    return (r.buf >> r.nbits) & ((1u << n) - 1u);
+}
+
+int extendSign(int v, int n)
+{
+    if (n <= 0 || n >= 31)
+        return v;
+    int vt = 1 << (n - 1);
+    if (v < vt)
+        v -= (1 << n) - 1;
+    return v;
+}
+
+int decodeSym(inout Reader r, int ti)
+{
+    if (ti < 0 || ti > 7)
+        return 0;
+    fill(r, 8u);
+    if (r.nbits >= 8u)
+    {
+        uint look = (r.buf >> (r.nbits - 8u)) & 0xffu;
+        uint packed = tb.lut[ti * 256 + int(look)];
+        uint len = packed & 0xffu;
+        if (len > 0u && len <= 8u)
+        {
+            r.nbits -= len;
+            return int(packed >> 8);
+        }
+    }
+
+    int base = ti * 16;
+    int code = 0;
+    for (int L = 0; L < 16; ++L)
+    {
+        if (r.nbits == 0u)
+            fill(r, 8u);
+        if (r.nbits == 0u)
+            return 0;
+        r.nbits -= 1u;
+        code = (code << 1) | int((r.buf >> r.nbits) & 1u);
+        int mx = tb.maxcode[base + L];
+        if (mx >= 0 && code <= mx)
+        {
+            int idx = tb.valptr[base + L] + code - tb.mincode[base + L];
+            if (idx < 0 || idx > 255)
+                return 0;
+            return int(tb.vals[ti * 256 + idx]);
+        }
+    }
+    return 0;
+}
+
+void putCoeff(uint dst, uint n, int v)
+{
+    if (dst + n < uint(pc.coeffLimit))
+        coeffs[dst + n] = v;
+}
+
+void main()
+{
+    uint mcu = gl_GlobalInvocationID.x;
+    if (int(mcu) >= pc.segCount)
+        return;
+
+    Ix ix = ixs[mcu];
+    Reader r;
+    r.pos = ix.pos;
+    r.endp = uint(pc.chunkBytes);
+    r.buf = ix.buf;
+    r.nbits = ix.nbits;
+
+    int p0 = ix.p0;
+    int p1 = ix.p1;
+    int p2 = ix.p2;
+    int p3 = ix.p3;
+    uint dst = mcu * uint(pc.blocks) * 64u;
+    uint n = 0u;
+
+    for (int b = 0; b < pc.blocks; ++b)
+    {
+        uint pack = pc.pack[b];
+        int dcTi = int(pack & 0xffu);
+        int acTi = int((pack >> 8) & 0xffu);
+        int pi = int((pack >> 16) & 0xffu);
+        int symbol = decodeSym(r, dcTi);
+        int diff = 0;
+        if (symbol != 0)
+            diff = extendSign(int(getBits(r, uint(symbol))), symbol);
+        int shown = diff;
+        if (pi == 0) { shown = diff + p0; p0 = shown; }
+        else if (pi == 1) { shown = diff + p1; p1 = shown; }
+        else if (pi == 2) { shown = diff + p2; p2 = shown; }
+        else { shown = diff + p3; p3 = shown; }
+        putCoeff(dst, n, shown);
+        n += 1u;
+
+        uint z = 1u;
+        while (z < 64u)
+        {
+            symbol = decodeSym(r, acTi);
+            if (symbol == 0)
+            {
+                while (z < 64u)
+                {
+                    putCoeff(dst, n, 0);
+                    n += 1u;
+                    z += 1u;
+                }
+                break;
+            }
+            int run = symbol >> 4;
+            int nb = symbol & 15;
+            if (nb == 0)
+            {
+                for (int k = 0; k < 16 && z < 64u; ++k)
+                {
+                    putCoeff(dst, n, 0);
+                    n += 1u;
+                    z += 1u;
+                }
+            }
+            else
+            {
+                int mag = extendSign(int(getBits(r, uint(nb))), nb);
+                for (int k = 0; k < run && z < 64u; ++k)
+                {
+                    putCoeff(dst, n, 0);
+                    n += 1u;
+                    z += 1u;
+                }
+                if (z < 64u)
+                {
+                    putCoeff(dst, n, mag);
+                    n += 1u;
+                    z += 1u;
+                }
+            }
+        }
+    }
+}
+)glsl";
+
 struct IdctPush
 {
     std::int32_t width;
@@ -929,6 +1154,224 @@ bool submitAndWait(VkQueue queue, VkCommandBuffer cmd, VkFence fence, VkDevice d
     return true;
 }
 
+struct CpuBit
+{
+    const std::uint8_t* data = nullptr;
+    std::uint32_t pos = 0;
+    std::uint32_t endp = 0;
+    std::uint32_t buf = 0;
+    std::uint32_t nbits = 0;
+
+    std::uint32_t pullByte()
+    {
+        if (pos >= endp)
+            return 0;
+        const std::uint32_t b = data[pos++];
+        if (b == 0xffu)
+        {
+            if (pos < endp && data[pos] == 0u)
+                ++pos;
+            else
+                pos = endp;
+        }
+        return b;
+    }
+
+    void fill(std::uint32_t need)
+    {
+        while (nbits < need && pos < endp)
+        {
+            buf = (buf << 8) | pullByte();
+            nbits += 8u;
+        }
+    }
+
+    std::uint32_t getBits(std::uint32_t n)
+    {
+        if (n >= 32u)
+            return 0;
+        fill(n);
+        if (nbits < n)
+            return 0;
+        nbits -= n;
+        return (buf >> nbits) & ((1u << n) - 1u);
+    }
+};
+
+int cpuExtend(int v, int n)
+{
+    if (n <= 0 || n >= 31)
+        return v;
+    const int vt = 1 << (n - 1);
+    if (v < vt)
+        v -= (1 << n) - 1;
+    return v;
+}
+
+int cpuSym(CpuBit& r, const TablesFlat& tb, int ti)
+{
+    if (ti < 0 || ti > 7)
+        return 0;
+    r.fill(8u);
+    if (r.nbits >= 8u)
+    {
+        const std::uint32_t look = (r.buf >> (r.nbits - 8u)) & 0xffu;
+        const std::uint32_t packed = tb.lut[ti * 256 + int(look)];
+        const std::uint32_t len = packed & 0xffu;
+        if (len > 0u && len <= 8u)
+        {
+            r.nbits -= len;
+            return int(packed >> 8);
+        }
+    }
+
+    const int base = ti * 16;
+    int code = 0;
+    for (int L = 0; L < 16; ++L)
+    {
+        if (r.nbits == 0u)
+            r.fill(8u);
+        if (r.nbits == 0u)
+            return 0;
+        r.nbits -= 1u;
+        code = (code << 1) | int((r.buf >> r.nbits) & 1u);
+        const int mx = tb.maxcode[base + L];
+        if (mx >= 0 && code <= mx)
+        {
+            const int idx = tb.valptr[base + L] + code - tb.mincode[base + L];
+            if (idx < 0 || idx > 255)
+                return 0;
+            return int(tb.vals[ti * 256 + idx]);
+        }
+    }
+    return 0;
+}
+
+// One MCU block. Predictor is updated. Returns false if the run leaves the block.
+bool cpuBlock(CpuBit& r, const TablesFlat& tb, int dc_ti, int ac_ti, int& pred)
+{
+    const int dc_sym = cpuSym(r, tb, dc_ti);
+    int diff = 0;
+    if (dc_sym != 0)
+        diff = cpuExtend(int(r.getBits(std::uint32_t(dc_sym))), dc_sym);
+    pred += diff;
+
+    int z = 1;
+    while (z < 64)
+    {
+        const int symbol = cpuSym(r, tb, ac_ti);
+        if (symbol == 0)
+            return true;
+        const int run = symbol >> 4;
+        const int nb = symbol & 15;
+        if (nb == 0)
+        {
+            z += 16;
+            if (z > 64)
+                return false;
+            continue;
+        }
+        r.getBits(std::uint32_t(nb));
+        z += run + 1;
+        if (z > 64)
+            return false;
+    }
+    return true;
+}
+
+bool buildCursors(const mango::image::jpeg::EntropyStream& stream, std::vector<McuCursor>& cursors,
+    std::string& error)
+{
+    cursors.clear();
+    const int total = stream.xmcu * stream.ymcu;
+    if (total <= 0)
+    {
+        error = "MCU grid is empty";
+        return false;
+    }
+    cursors.resize(std::size_t(total));
+
+    TablesFlat flat = {};
+    for (int i = 0; i < 128; ++i)
+        flat.maxcode[i] = -1;
+    for (const auto& table : stream.huffman)
+    {
+        const int index = table.cls * 4 + table.id;
+        if (index < 0 || index >= 8)
+        {
+            error = "Huffman table id is outside 0..3";
+            return false;
+        }
+        TableGpu built = {};
+        buildTable(table, built);
+        for (int i = 0; i < 16; ++i)
+        {
+            flat.mincode[index * 16 + i] = built.mincode[i];
+            flat.maxcode[index * 16 + i] = built.maxcode[i];
+            flat.valptr[index * 16 + i] = built.valptr[i];
+        }
+        std::memcpy(flat.lut + index * 256, built.lut, sizeof(built.lut));
+        std::memcpy(flat.vals + index * 256, built.vals, sizeof(built.vals));
+    }
+
+    int dc_ti[10] = {};
+    int ac_ti[10] = {};
+    int pred_i[10] = {};
+    for (int b = 0; b < stream.blocks_in_mcu; ++b)
+    {
+        dc_ti[b] = stream.block[b].dc;
+        ac_ti[b] = 4 + stream.block[b].ac;
+        int pi = stream.block[b].component;
+        if (pi < 0 || pi > 3)
+            pi = 3;
+        pred_i[b] = pi;
+    }
+
+    for (const auto& seg : stream.segments)
+    {
+        if (!seg.bytes.address || seg.mcus <= 0)
+        {
+            error = "entropy segment is empty";
+            return false;
+        }
+        CpuBit r;
+        r.data = static_cast<const std::uint8_t*>(seg.bytes.address);
+        r.endp = std::uint32_t(seg.bytes.size);
+        int pred[4] = {};
+        for (int m = 0; m < seg.mcus; ++m)
+        {
+            if (r.pos >= r.endp && r.nbits == 0)
+            {
+                error = "entropy ended before the last MCU";
+                return false;
+            }
+            const int slot = seg.mcu_y0 * stream.xmcu + m;
+            if (slot < 0 || slot >= total)
+            {
+                error = "MCU cursor is outside the grid";
+                return false;
+            }
+            McuCursor& cur = cursors[std::size_t(slot)];
+            cur.pos = std::uint32_t(seg.packed_offset) + r.pos;
+            cur.nbits = r.nbits;
+            cur.buf = r.buf;
+            cur.p0 = pred[0];
+            cur.p1 = pred[1];
+            cur.p2 = pred[2];
+            cur.p3 = pred[3];
+            for (int b = 0; b < stream.blocks_in_mcu; ++b)
+            {
+                if (!cpuBlock(r, flat, dc_ti[b], ac_ti[b], pred[pred_i[b]]))
+                {
+                    error = "Huffman run left the block";
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool MangoGpuDecoder::extract(mango::ConstMemory jpeg, std::string& error)
@@ -1094,12 +1537,23 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         return false;
     }
 
+    index_us = 0;
+    if (index_mode)
+    {
+        const mango::u64 t_index = nowUs();
+        if (!buildCursors(stream, cursors, error))
+            return false;
+        index_us = nowUs() - t_index;
+        index_mcus = int(cursors.size());
+    }
+
     if (!m_pipeline)
     {
         const mango::u64 t_compile = nowUs();
 
         mango::vulkan::Compiler compiler;
-        mango::vulkan::Shader shader = compiler.compile(kHuffmanSource, mango::vulkan::ShaderStage::Compute);
+        const char* const huffman_source = index_mode ? kIndexHuffmanSource : kHuffmanSource;
+        mango::vulkan::Shader shader = compiler.compile(huffman_source, mango::vulkan::ShaderStage::Compute);
         if (!shader)
         {
             error = "huffman shader compile failed:\n" + shader.log;
@@ -1184,24 +1638,38 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
             return false;
         }
 
-        std::vector<SegGpu> segs(stream.segments.size());
-        for (size_t i = 0; i < stream.segments.size(); ++i)
+        if (index_mode)
         {
-            const auto& seg = stream.segments[i];
-            segs[i].offset = std::uint32_t(seg.packed_offset);
-            segs[i].size = std::uint32_t(seg.bytes.size);
-            segs[i].y0 = std::uint32_t(seg.mcu_y0);
-            segs[i].y1 = std::uint32_t(seg.mcu_y1);
+            const VkDeviceSize bytes = VkDeviceSize(cursors.size()) * sizeof(McuCursor);
+            m_segs = allocator.createBuffer(std::max(bytes, VkDeviceSize(sizeof(McuCursor))),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
+            if (!m_segs || !m_segs.mapped)
+            {
+                error = "MCU cursor buffer failed";
+                return false;
+            }
         }
-        m_segs = allocator.createBuffer(segs.size() * sizeof(SegGpu),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
-        if (!m_segs || !m_segs.mapped)
+        else
         {
-            error = "segment buffer failed";
-            return false;
+            std::vector<SegGpu> segs(stream.segments.size());
+            for (size_t i = 0; i < stream.segments.size(); ++i)
+            {
+                const auto& seg = stream.segments[i];
+                segs[i].offset = std::uint32_t(seg.packed_offset);
+                segs[i].size = std::uint32_t(seg.bytes.size);
+                segs[i].y0 = std::uint32_t(seg.mcu_y0);
+                segs[i].y1 = std::uint32_t(seg.mcu_y1);
+            }
+            m_segs = allocator.createBuffer(segs.size() * sizeof(SegGpu),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
+            if (!m_segs || !m_segs.mapped)
+            {
+                error = "segment buffer failed";
+                return false;
+            }
+            std::memcpy(m_segs.mapped, segs.data(), segs.size() * sizeof(SegGpu));
+            allocator.flush(m_segs.allocation, 0, segs.size() * sizeof(SegGpu));
         }
-        std::memcpy(m_segs.mapped, segs.data(), segs.size() * sizeof(SegGpu));
-        allocator.flush(m_segs.allocation, 0, segs.size() * sizeof(SegGpu));
 
         TablesFlat flat = {};
         for (int i = 0; i < 128; ++i)
@@ -1481,21 +1949,33 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
         const std::uint32_t n = (std::uint32_t(seg.bytes.size) + chunk - 1u) / chunk;
         max_chunks = std::max(max_chunks, std::max(n, 1u));
     }
-    if (max_chunks > kSyncLanes)
+    if (!index_mode && max_chunks > kSyncLanes)
     {
         error = "entropy segment does not fit in one workgroup";
         return false;
     }
-    const uint32_t groups = uint32_t(stream.segments.size());
+    uint32_t groups = uint32_t(stream.segments.size());
     push.waveBase = 0;
+    if (index_mode)
+    {
+        push.segCount = int(cursors.size());
+        push.chunkBytes = int(std::min<std::uint64_t>(stream.packed_bytes, 0x7fffffffull));
+        sync_chunks = 0;
+        groups = uint32_t((cursors.size() + 63u) / 64u);
+        std::memcpy(m_segs.mapped, cursors.data(), cursors.size() * sizeof(McuCursor));
+        allocator.flush(m_segs.allocation, 0, cursors.size() * sizeof(McuCursor));
+        std::printf("mango-gpu: index dispatch %u MCUs\n", uint32_t(cursors.size()));
+    }
+    else
+    {
+        std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
+    }
+    std::fflush(stdout);
 
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-
-    std::printf("mango-gpu: sync dispatch %u segments, chunk %u bytes\n", groups, chunk);
-    std::fflush(stdout);
 
     const mango::u64 t0 = nowUs();
     vkResetCommandBuffer(m_cmd, 0);
@@ -1513,31 +1993,41 @@ bool MangoGpuDecoder::decodeBlocks(mango::vulkan::VulkanWindow& window,
     vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout,
         0, 1, &m_set, 0, nullptr);
     vkCmdPushConstants(m_cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(m_cmd, groups, 1, 1);
+    vkCmdDispatch(m_cmd, std::max(groups, 1u), 1, 1);
 
-    VkMemoryBarrier stats_ready = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-    };
-    vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 1, &stats_ready, 0, nullptr, 0, nullptr);
-    const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(CarryGpu);
-    VkBufferCopy stats_region = { 0, 0, stat_bytes };
-    vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
+    if (!index_mode)
+    {
+        VkMemoryBarrier stats_ready = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &stats_ready, 0, nullptr, 0, nullptr);
+        const VkDeviceSize stat_bytes = VkDeviceSize(groups) * sizeof(CarryGpu);
+        VkBufferCopy stats_region = { 0, 0, stat_bytes };
+        vkCmdCopyBuffer(m_cmd, m_stats.buffer, m_stats_rb.buffer, 1, &stats_region);
+    }
     vkEndCommandBuffer(m_cmd);
 
     if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
         return false;
     huffman_us = nowUs() - t0;
 
-    int max_rounds = 0;
-    const auto* round_ptr = static_cast<const CarryGpu*>(m_stats_rb.mapped);
-    for (uint32_t i = 0; i < groups; ++i)
-        max_rounds = std::max(max_rounds, int(round_ptr[i].rounds));
-    sync_rounds = max_rounds;
-    std::printf("mango-gpu: sync rounds max %d\n", max_rounds);
-    std::fflush(stdout);
+    if (index_mode)
+    {
+        sync_rounds = -1;
+    }
+    else
+    {
+        int max_rounds = 0;
+        const auto* round_ptr = static_cast<const CarryGpu*>(m_stats_rb.mapped);
+        for (uint32_t i = 0; i < groups; ++i)
+            max_rounds = std::max(max_rounds, int(round_ptr[i].rounds));
+        sync_rounds = max_rounds;
+        std::printf("mango-gpu: sync rounds max %d\n", max_rounds);
+        std::fflush(stdout);
+    }
 
     mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
     const mango::image::jpeg::JpegInfo& info = info_decoder.info();

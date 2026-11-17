@@ -94,7 +94,7 @@ void configureParser(const CommandLine& commands, Args& args)
 
     commands.option("--backend",
         "mango | hybrid | gpu | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
-        "         hybrid = Huffman+VK compute; gpu = Mango1/RST/serial entropy -> VkImage;\n"
+        "         hybrid = Huffman+VK compute; gpu = self-sync, then mango-gpu-index;\n"
         "         roc = VCN JPEG; intel = QSV JPEG (igpu→host→VkImage, curiosity);\n"
         "         wic = Windows Imaging Component JPEG → host RGBA → VkImage;\n"
         "         turbojpeg = libjpeg-turbo (host RGBA → VkImage);\n"
@@ -180,6 +180,10 @@ void configureParser(const CommandLine& commands, Args& args)
 
     commands.flag("--hybrid-floor", "hybrid: Huffman only (no VK compute) — measure floor",
         [&]() { args.hybrid_floor = true; });
+
+    commands.flag("--gpu-index",
+        "legacy no-op; mango-gpu-index always runs immediately after mango-gpu",
+        [&]() {});
 
     commands.positional([&](std::string_view token) { args.filename = token; });
 }
@@ -1150,21 +1154,37 @@ public:
             r.device_only = true;
             r.image.width = job.gpu->stream.width;
             r.image.height = job.gpu->stream.height;
-            r.decode_us = job.gpu->huffman_us;
+            r.decode_us = job.gpu->index_mode
+                ? job.gpu->index_us + job.gpu->huffman_us
+                : job.gpu->huffman_us;
             r.promote_us = job.gpu->resolve_us;
             mango::u64 wall = nowUs() - t0;
             if (job.gpu->compile_last_us > 0 && wall > job.gpu->compile_last_us)
                 wall -= job.gpu->compile_last_us;
             r.ready_us = wall;
             addMilestone(r.milestones, "vk_ready", t0);
-            printLine("  gpu: huffman {:.2f} ms, idct {:.2f} ms, sync rounds {} chunk {} B{}",
-                job.gpu->huffman_us / 1000.0,
-                job.gpu->resolve_us / 1000.0,
-                job.gpu->sync_rounds,
-                job.gpu->sync_chunks,
-                job.gpu->compile_last_us
-                    ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
-                    : "");
+            if (job.gpu->index_mode)
+            {
+                printLine("  gpu: index {:.2f} ms ({} MCUs), huffman {:.2f} ms, idct {:.2f} ms{}",
+                    job.gpu->index_us / 1000.0,
+                    job.gpu->index_mcus,
+                    job.gpu->huffman_us / 1000.0,
+                    job.gpu->resolve_us / 1000.0,
+                    job.gpu->compile_last_us
+                        ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
+                        : "");
+            }
+            else
+            {
+                printLine("  gpu: huffman {:.2f} ms, idct {:.2f} ms, sync rounds {} chunk {} B{}",
+                    job.gpu->huffman_us / 1000.0,
+                    job.gpu->resolve_us / 1000.0,
+                    job.gpu->sync_rounds,
+                    job.gpu->sync_chunks,
+                    job.gpu->compile_last_us
+                        ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
+                        : "");
+            }
 
             if (std::getenv("GPUJPEG_CHECK"))
             {
@@ -1186,7 +1206,7 @@ public:
             r.e2e_us = r.ready_us + r.present_us;
             r.ok = true;
             slot.ready = true;
-            setTitle(fmt::format("gpujpeg [mango-gpu] READY {:.2f} ms", r.ready_us / 1000.0));
+            setTitle(fmt::format("gpujpeg [{}] READY {:.2f} ms", job.name, r.ready_us / 1000.0));
             return r;
         }
 
@@ -1981,15 +2001,17 @@ int main(int argc, const char* argv[])
     std::vector<std::unique_ptr<MangoGpuDecoder>> gpu_decoders;
     if (want_gpu)
     {
+        auto add_gpu = [&](bool index_mode) -> bool
+        {
             auto gpu = std::make_unique<MangoGpuDecoder>();
+            gpu->index_mode = index_mode;
             std::string error;
             if (!gpu->extract(jpeg, error))
             {
                 printLine("mango-gpu extract FAILED: {}", error);
-                if (args.backend == Backend::Gpu)
-                    return 1;
+                return false;
             }
-            else
+            if (!index_mode)
             {
                 const jpeg::EntropyStream& s = gpu->stream;
                 const int mcus = s.segments.empty() ? 0 : s.segments.front().mcus;
@@ -2004,14 +2026,26 @@ int main(int argc, const char* argv[])
                 printLine("mango-gpu: extract {:.2f} ms  ({} MCUs, {} blocks/MCU)",
                     gpu->extract_us / 1000.0, mcus, s.blocks_in_mcu);
                 std::fflush(stdout);
-
-                Job job;
-                job.name = "mango-gpu";
-                job.use_gpu = true;
-                job.gpu = gpu.get();
-                jobs.push_back(std::move(job));
-                gpu_decoders.push_back(std::move(gpu));
             }
+
+            Job job;
+            job.name = index_mode ? "mango-gpu-index" : "mango-gpu";
+            job.use_gpu = true;
+            job.gpu = gpu.get();
+            jobs.push_back(std::move(job));
+            gpu_decoders.push_back(std::move(gpu));
+            return true;
+        };
+        // Self-sync first, then the CPU-indexed MCU pass, so one scoreboard shows both.
+        if (!add_gpu(false))
+        {
+            if (args.backend == Backend::Gpu)
+                return 1;
+        }
+        else if (!add_gpu(true) && args.backend == Backend::Gpu)
+        {
+            return 1;
+        }
     }
 
     auto addNv = [&](NvJpegMode mode)
