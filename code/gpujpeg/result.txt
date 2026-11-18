@@ -105,45 +105,45 @@ GPU: nVidia RTX 4090
 file: mango1.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    14.35ms    2.89ms    3.98ms    2.59ms   16.94ms  host->VkImage
-mango-hybrid              8.81ms    1.65ms    7.16ms    0.38ms   24.83ms  file->VkImage
-mango-gpu                 7.61ms    1.88ms    0.40ms    0.39ms    8.00ms  file->VkImage  fastest
-mango-gpu-index          TODO
-nvjpeg-hybrid            10.85ms    8.77ms    2.08ms    0.16ms   11.01ms  file->VkImage
-nvjpeg-gpu               10.02ms    9.00ms    1.02ms    0.23ms   10.25ms  file->VkImage
-intel-vpl                34.26ms   29.85ms    4.41ms    0.26ms   34.53ms  igpu->VkImage
-wic                      TODO
-turbojpeg                TODO
+mango                    18.96ms    2.49ms    8.77ms    2.72ms   21.69ms  host->VkImage
+mango-hybrid             10.91ms    1.78ms    9.13ms    0.41ms   37.09ms  file->VkImage
+mango-gpu                 9.14ms    3.08ms    1.84ms    0.28ms    9.41ms  file->VkImage  fastest
+mango-gpu-index          26.96ms   21.00ms    1.62ms    0.29ms   27.25ms  file->VkImage
+nvjpeg-hybrid            10.94ms    8.76ms    2.18ms    0.19ms   11.13ms  file->VkImage
+nvjpeg-gpu                9.80ms    8.79ms    1.02ms    0.17ms    9.98ms  file->VkImage
+intel-vpl                34.99ms   30.21ms    4.77ms    0.19ms   35.18ms  igpu->VkImage
+wic                      38.04ms   34.16ms    3.88ms    0.20ms   38.25ms  host->VkImage
+turbojpeg                31.70ms   27.56ms    4.14ms    0.28ms   31.99ms  host->VkImage
 
 >>>>
 
 file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    14.10ms    2.97ms    3.90ms    2.69ms   16.80ms  host->VkImage
-mango-hybrid             13.15ms    2.35ms   10.80ms    0.17ms   23.72ms  file->VkImage
-mango-gpu                 7.13ms    2.06ms    0.50ms    0.24ms    7.38ms  file->VkImage  fastest
-mango-gpu-index          TODO
-nvjpeg-hybrid            11.15ms    9.10ms    2.05ms    0.17ms   11.32ms  file->VkImage
-nvjpeg-gpu                9.99ms    8.98ms    1.01ms    0.16ms   10.15ms  file->VkImage
-intel-vpl                18.99ms   13.85ms    5.14ms    0.20ms   19.19ms  igpu->VkImage
-wic                      TODO
-turbojpeg                TODO
+mango                    14.32ms    2.33ms    3.88ms    2.85ms   17.18ms  host->VkImage
+mango-hybrid              7.71ms    1.58ms    6.13ms    0.40ms   20.72ms  file->VkImage  fastest
+mango-gpu                 9.06ms    3.09ms    1.82ms    0.23ms    9.30ms  file->VkImage
+mango-gpu-index          31.36ms   24.78ms    1.77ms    0.29ms   31.65ms  file->VkImage
+nvjpeg-hybrid            11.37ms    9.19ms    2.18ms    0.19ms   11.56ms  file->VkImage
+nvjpeg-gpu               10.06ms    9.05ms    1.01ms    0.17ms   10.23ms  file->VkImage
+intel-vpl               506.61ms  500.88ms    5.71ms    0.39ms  507.00ms  igpu->VkImage
+wic                      42.41ms   36.22ms    6.17ms    0.44ms   42.85ms  host->VkImage
+turbojpeg                35.53ms   29.46ms    6.06ms    0.33ms   35.87ms  host->VkImage
 
 >>>>
 
 file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    43.32ms   31.55ms    4.60ms    3.00ms   46.32ms  host->VkImage
-mango-hybrid             30.72ms   27.62ms    3.10ms    0.39ms   44.09ms  file->VkImage
-mango-gpu               247.43ms  242.06ms    0.42ms    0.37ms  247.81ms  file->VkImage
-mango-gpu-index          TODO
-nvjpeg-hybrid            12.61ms   10.51ms    2.08ms    0.24ms   12.85ms  file->VkImage
-nvjpeg-gpu               10.58ms    9.56ms    1.00ms    0.18ms   10.75ms  file->VkImage  fastest
-intel-vpl               461.34ms  455.88ms    5.45ms    0.34ms  461.68ms  igpu->VkImage
-wic                      TODO
-turbojpeg                TODO
+mango                    32.99ms   21.38ms    4.37ms    2.63ms   35.63ms  host->VkImage
+mango-hybrid             20.04ms   18.08ms    1.96ms    0.38ms   31.97ms  file->VkImage
+mango-gpu               365.02ms  358.87ms    1.81ms    0.41ms  365.42ms  file->VkImage
+mango-gpu-index          31.66ms   24.89ms    1.59ms    0.28ms   31.94ms  file->VkImage
+nvjpeg-hybrid            11.42ms    9.24ms    2.18ms    0.18ms   11.61ms  file->VkImage
+nvjpeg-gpu               10.00ms    9.06ms    0.94ms    0.17ms   10.17ms  file->VkImage  fastest
+intel-vpl               156.35ms  151.29ms    5.05ms    0.35ms  156.70ms  igpu->VkImage
+wic                      36.37ms   32.42ms    3.95ms    0.42ms   36.80ms  host->VkImage
+turbojpeg                31.62ms   27.16ms    4.46ms    0.40ms   32.02ms  host->VkImage
 
 ---------------------------------------------------------------------------------------------------------
 OS: Linux Arch
