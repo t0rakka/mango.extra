@@ -2415,20 +2415,16 @@ int main(int argc, const char* argv[])
     if (physicalDeviceIsRadv(selected_device, radv_info))
     {
         // Self-sync hands the cursor through shared memory. RADV miscompiles that,
-        // so the lanes never agree. A serial scan is one segment and never
-        // recovers. Restart-split scans still run.
-        const auto is_serial_self_sync = [](const Job& job)
+        // so the lanes never agree on a serial scan or a restart-split scan.
+        const auto is_self_sync = [](const Job& job)
         {
-            if (!job.use_gpu || !job.gpu || job.gpu->index_mode)
-                return false;
-            const jpeg::EntropyStream& s = job.gpu->stream;
-            return s.segments.size() == 1 && s.ymcu > 0 && s.rows_per_segment >= s.ymcu;
+            return job.use_gpu && job.gpu && !job.gpu->index_mode;
         };
-        if (std::any_of(jobs.begin(), jobs.end(), is_serial_self_sync))
+        if (std::any_of(jobs.begin(), jobs.end(), is_self_sync))
         {
             radv_gpu_note = "NOTE: blacklisted (RADV driver shared memory bug: sync failure)";
             printLine("mango-gpu: {} ({})", radv_gpu_note, radv_info);
-            std::erase_if(jobs, is_serial_self_sync);
+            std::erase_if(jobs, is_self_sync);
         }
     }
     if (jobs.empty())
