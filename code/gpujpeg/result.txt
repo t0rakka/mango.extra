@@ -137,7 +137,7 @@ backend                    READY    decode   promote   present       e2e  path
 mango                    12.01ms    2.60ms    5.70ms    5.03ms   17.05ms  host->VkImage
 mango-hybrid              6.28ms    1.32ms    4.96ms    0.46ms   33.12ms  file->VkImage
 mango-gpu                 9.44ms    5.21ms    0.77ms    0.25ms    9.69ms  file->VkImage
-mango-gpu-index          35.94ms   31.17ms    0.54ms    0.62ms   36.55ms  file->VkImage
+mango-gpu-index          13.59ms    8.60ms    8.02ms    0.50ms   14.09ms  file->VkImage
 wic                      34.78ms   30.14ms    4.63ms    0.26ms   35.04ms  host->VkImage
 turbojpeg                29.58ms   25.22ms    4.36ms    0.24ms   29.82ms  host->VkImage
 
@@ -147,7 +147,7 @@ backend                    READY    decode   promote   present       e2e  path
 mango                    27.39ms   18.56ms    5.28ms    4.93ms   32.32ms  host->VkImage
 mango-hybrid             16.79ms   16.03ms    0.76ms    0.37ms   40.54ms  file->VkImage
 mango-gpu               496.04ms  491.30ms    0.70ms    0.29ms  496.33ms  file->VkImage
-mango-gpu-index          37.91ms   33.00ms    0.57ms    0.48ms   38.39ms  file->VkImage
+mango-gpu-index          27.92ms   23.12ms    0.52ms    0.73ms   28.65ms  file->VkImage
 wic                      32.37ms   27.12ms    5.24ms    0.28ms   32.65ms  host->VkImage
 turbojpeg                29.71ms   24.90ms    4.80ms    0.35ms   30.06ms  host->VkImage
 
