@@ -1827,6 +1827,32 @@ bool probeSize(ConstMemory jpeg, int& width, int& height, std::string& error)
     return true;
 }
 
+// Vulkan 1.2 VkPhysicalDeviceDriverProperties. RADV is VK_DRIVER_ID_MESA_RADV.
+// AMDVLK and the Windows AMD driver use different driver IDs.
+bool physicalDeviceIsRadv(VkPhysicalDevice device, std::string& driver_info)
+{
+    driver_info.clear();
+    if (!device)
+        return false;
+
+    VkPhysicalDeviceDriverProperties driver
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 props
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &driver,
+    };
+    vkGetPhysicalDeviceProperties2(device, &props);
+    if (driver.driverID != VK_DRIVER_ID_MESA_RADV)
+        return false;
+    driver_info = driver.driverInfo;
+    if (driver_info.empty())
+        driver_info = driver.driverName;
+    return true;
+}
+
 } // namespace
 
 int main(int argc, const char* argv[])
@@ -2382,6 +2408,45 @@ int main(int argc, const char* argv[])
     Instance instance(appInfo, layers, extensions);
     VulkanContext ctx(instance);
 
+    // Chosen before the window so a skipped mango-gpu cell is not laid out.
+    const VkPhysicalDevice selected_device = selectPhysicalDevice(instance);
+    std::string radv_info;
+    std::string radv_gpu_note;
+    if (physicalDeviceIsRadv(selected_device, radv_info))
+    {
+        // Self-sync hands the cursor through shared memory. RADV miscompiles that,
+        // so the lanes never agree. A serial scan is one segment and never
+        // recovers. Restart-split scans still run.
+        const auto is_serial_self_sync = [](const Job& job)
+        {
+            if (!job.use_gpu || !job.gpu || job.gpu->index_mode)
+                return false;
+            const jpeg::EntropyStream& s = job.gpu->stream;
+            return s.segments.size() == 1 && s.ymcu > 0 && s.rows_per_segment >= s.ymcu;
+        };
+        if (std::any_of(jobs.begin(), jobs.end(), is_serial_self_sync))
+        {
+            radv_gpu_note = "NOTE: blacklisted (RADV driver shared memory bug: sync failure)";
+            printLine("mango-gpu: {} ({})", radv_gpu_note, radv_info);
+            std::erase_if(jobs, is_serial_self_sync);
+        }
+    }
+    if (jobs.empty())
+    {
+        if (radv_gpu_note.empty())
+        {
+            printLine("No backends to run.");
+            return 1;
+        }
+        printLine("==================================================");
+        printLine("Primary metric: READY = start -> VkImage usable");
+        printLine("{:<22} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
+            "backend", "READY", "decode", "promote", "present", "e2e", "path");
+        printLine("");
+        printLine("{:<22} {}", "mango-gpu", radv_gpu_note);
+        return 0;
+    }
+
     int cell_w = 0;
     int cell_h = 0;
     fitCell(width, height, cell_w, cell_h);
@@ -2411,7 +2476,6 @@ int main(int argc, const char* argv[])
 
     // A non-null deviceCreateInfoPNext replaces mango's Vulkan 1.3 chain, so this
     // duplicates dynamic rendering, timeline semaphores, and descriptor indexing.
-    const VkPhysicalDevice selected_device = selectPhysicalDevice(instance);
     VkPhysicalDeviceDescriptorIndexingFeatures supported_indexing =
     {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
@@ -2497,10 +2561,20 @@ int main(int argc, const char* argv[])
     printLine("{:<22} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
         "backend", "READY", "decode", "promote", "present", "e2e", "path");
     printLine("");
+    bool radv_note_printed = false;
+    auto printRadvGpuNote = [&]()
+    {
+        if (radv_note_printed || radv_gpu_note.empty())
+            return;
+        radv_note_printed = true;
+        printLine("{:<22} {}", "mango-gpu", radv_gpu_note);
+    };
     for (const auto& r : window.results)
     {
         if (!r.ok)
             continue;
+        if (r.backend.starts_with("mango-gpu-index"))
+            printRadvGpuNote();
         if (r.pipeline_count > 0)
         {
             printLine("{:<22} {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms  {}",
@@ -2522,6 +2596,7 @@ int main(int argc, const char* argv[])
             r.e2e_us / 1000.0,
             path);
     }
+    printRadvGpuNote();
 
     return 0;
 }
