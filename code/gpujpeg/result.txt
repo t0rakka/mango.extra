@@ -75,7 +75,7 @@ backend                    READY    decode   promote   present       e2e  path
 mango                    14.32ms    2.33ms    3.88ms    2.85ms   17.18ms  host->VkImage
 mango-hybrid              7.71ms    1.58ms    6.13ms    0.40ms   20.72ms  file->VkImage
 mango-gpu                 9.06ms    3.09ms    1.82ms    0.23ms    9.30ms  file->VkImage
-mango-gpu-index          31.36ms   24.78ms    1.77ms    0.29ms   31.65ms  file->VkImage
+mango-gpu-index          14.00ms    6.29ms    6.84ms    0.38ms   14.38ms  file->VkImage
 nvjpeg-hybrid            11.37ms    9.19ms    2.18ms    0.19ms   11.56ms  file->VkImage
 nvjpeg-gpu               10.06ms    9.05ms    1.01ms    0.17ms   10.23ms  file->VkImage
 intel-vpl               506.61ms  500.88ms    5.71ms    0.39ms  507.00ms  igpu->VkImage
