@@ -41,7 +41,9 @@ In-flight work stays bounded. Each task needs a destination image and, on the hy
 
 ### Backend choice (later)
 
-Not implemented. Still collecting timings per machine (`result.txt`). The decoder will own every backend the device can run, and each file picks among the ones that can handle it. Lossless, progressive, or arithmetic files simply drop the backends that cannot decode them. If none remain, the same callback still delivers a texture via the CPU decoder. A static rank such as NVIDIA, then Apple VT, then AMD is only a sketch. Per-file shape (restart vs one serial scan) changes who wins. Do not hard-wire a rank until the tables say so.
+Not implemented. Every path stays in the workbench so `result.txt` can keep speaking. The decoder will own every backend the device can run, and each file picks among the ones that can handle it. Lossless, progressive, or arithmetic files simply drop the backends that cannot decode them. If none remain, the same callback still delivers a texture via the CPU decoder. A static rank such as NVIDIA, then Apple VT, then AMD is only a sketch. Per-file shape (restart vs one serial scan) changes who wins. Selection waits until the same files have been timed on enough machines. Do not drop a column, and do not hard-wire a rank, until the tables say so.
+
+Among the mango compute paths, mango-gpu-index is the one the current numbers point at. Restart files scan N MCU rows per task (N in 8..16) and submit that group as one batch, so the CPU walk is no longer the long pole on a file that already has one restart per row. The self-sync mango-gpu path stays beside it, because a single machine can still prefer it on a restart file and the table is the decision. Hybrid, nvJPEG, rocJPEG, VideoToolbox, turbojpeg, WIC, and Intel stay for the same reason.
 
 Size-specific state (VideoToolbox session, nvJPEG buffers) is recreated when dimensions change. Compute pipelines are not.
 
@@ -51,6 +53,7 @@ Size-specific state (VideoToolbox session, nvJPEG buffers) is recreated when dim
 - `MangoGpuDecoder` and `MangoHybridCompute` still keep their pipelines on the per-image object. A new object recompiles. Lifting those pipelines onto a long-lived decoder is the next API step. Do not paper over that by telling callers to reuse a one-shot decoder: `MangoGpuDecoder::upload()` accepts one bitstream, and its descriptors stay bound to that image.
 - Hybrid: Huffman workers never wait on the GPU, on a free buffer, or on each other. Segments may finish in any order. The graphics thread alone submits and waits on fences. Coefficient storage for the whole frame is allocated before the workers start.
 - mango-gpu Huffman is one workgroup per entropy segment, 64 lanes, one submit. Shifts of 32 or more are rejected (AMD masks the count to 5 bits and would otherwise accept a bad speculative cursor). Writes stop at the segment coefficient count so restart pad bits do not spill into the next MCU row.
+- mango-gpu-index builds one MCU cursor per block on the CPU, then the GPU Huffman-decodes from those cursors. One-row restart files split the rows across the thread pool. A single serial segment stays on one thread and still batches every 16 MCU rows. The CPU Huffman walk is force-inlined (`__forceinline` on MSVC, `always_inline` otherwise): a second caller otherwise outlines it and the serial scan slows down.
 
 ### Do not
 
@@ -271,7 +274,7 @@ On this box **full mango NEON decode (~3.7 ms) beats stopping at coefficients (~
 ## Agent checklist
 
 1. Read the roadmap at the top of this file before changing a decode path. Then `src/backends.hpp`, the backend you are in, `decoded_texture.*`, and `main.cpp`.
-2. Current stage is one-file latency (`READY`). Batch throughput and auto backend selection are later. The API call shape should still allow a second `decode()` before the previous callback.
+2. Current stage is one-file latency (`READY`). Batch throughput and auto backend selection are later. Keep every backend in the table; mango-gpu-index is the mango compute path the numbers currently point at, and the others stay until the tables agree. The API call shape should still allow a second `decode()` before the previous callback.
 3. Next structural step: a long-lived GPU JPEG decoder that keeps compiled pipelines, and a new `JpegDecoder` per file.
 4. ROC on gfx1201 (RX 9070 XT) is outside AMD's published JPEG-core table. A successful `rocJpegCreate` on that GPU is not evidence of a JPEG engine. Confirm on device before trusting the number.
 5. Stay stand-alone until the API settles. A mango plugin is a later migration. OpenGL / D3D outputs share the same READY contract when they land.

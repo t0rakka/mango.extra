@@ -4,9 +4,12 @@
 #include "decoded_texture.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include <mango/core/thread.hpp>
@@ -1156,6 +1159,12 @@ bool submitAndWait(VkQueue queue, VkCommandBuffer cmd, VkFence fence, VkDevice d
     return true;
 }
 
+#if defined(_MSC_VER)
+#define GPUJPEG_FORCE_INLINE __forceinline
+#else
+#define GPUJPEG_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
 struct CpuBit
 {
     const std::uint8_t* data = nullptr;
@@ -1164,7 +1173,7 @@ struct CpuBit
     std::uint32_t buf = 0;
     std::uint32_t nbits = 0;
 
-    std::uint32_t pullByte()
+    GPUJPEG_FORCE_INLINE std::uint32_t pullByte()
     {
         if (pos >= endp)
             return 0;
@@ -1179,7 +1188,7 @@ struct CpuBit
         return b;
     }
 
-    void fill(std::uint32_t need)
+    GPUJPEG_FORCE_INLINE void fill(std::uint32_t need)
     {
         while (nbits < need && pos < endp)
         {
@@ -1188,7 +1197,7 @@ struct CpuBit
         }
     }
 
-    std::uint32_t getBits(std::uint32_t n)
+    GPUJPEG_FORCE_INLINE std::uint32_t getBits(std::uint32_t n)
     {
         if (n >= 32u)
             return 0;
@@ -1200,7 +1209,7 @@ struct CpuBit
     }
 };
 
-int cpuExtend(int v, int n)
+GPUJPEG_FORCE_INLINE int cpuExtend(int v, int n)
 {
     if (n <= 0 || n >= 31)
         return v;
@@ -1210,7 +1219,7 @@ int cpuExtend(int v, int n)
     return v;
 }
 
-int cpuSym(CpuBit& r, const TablesFlat& tb, int ti)
+GPUJPEG_FORCE_INLINE int cpuSym(CpuBit& r, const TablesFlat& tb, int ti)
 {
     if (ti < 0 || ti > 7)
         return 0;
@@ -1250,7 +1259,7 @@ int cpuSym(CpuBit& r, const TablesFlat& tb, int ti)
 }
 
 // One MCU block. Predictor is updated. Returns false if the run leaves the block.
-bool cpuBlock(CpuBit& r, const TablesFlat& tb, int dc_ti, int ac_ti, int& pred)
+GPUJPEG_FORCE_INLINE bool cpuBlock(CpuBit& r, const TablesFlat& tb, int dc_ti, int ac_ti, int& pred)
 {
     const int dc_sym = cpuSym(r, tb, dc_ti);
     int diff = 0;
@@ -1276,6 +1285,71 @@ bool cpuBlock(CpuBit& r, const TablesFlat& tb, int dc_ti, int ac_ti, int& pred)
         r.getBits(std::uint32_t(nb));
         z += run + 1;
         if (z > 64)
+            return false;
+    }
+    return true;
+}
+
+#undef GPUJPEG_FORCE_INLINE
+
+// One restart segment. DC predictors start at zero. Cursors land at
+// mcu_y0 * xmcu and do not overlap any other segment.
+bool scanSegment(const mango::image::jpeg::EntropyStream& stream, const TablesFlat& flat,
+    const int* dc_ti, const int* ac_ti, const int* pred_i,
+    const mango::image::jpeg::EntropySegment& seg, McuCursor* cursors, int total,
+    std::string& error)
+{
+    if (!seg.bytes.address || seg.mcus <= 0)
+    {
+        error = "entropy segment is empty";
+        return false;
+    }
+    CpuBit r;
+    r.data = static_cast<const std::uint8_t*>(seg.bytes.address);
+    r.endp = std::uint32_t(seg.bytes.size);
+    int pred[4] = {};
+    for (int m = 0; m < seg.mcus; ++m)
+    {
+        if (r.pos >= r.endp && r.nbits == 0)
+        {
+            error = "entropy ended before the last MCU";
+            return false;
+        }
+        const int slot = seg.mcu_y0 * stream.xmcu + m;
+        if (slot < 0 || slot >= total)
+        {
+            error = "MCU cursor is outside the grid";
+            return false;
+        }
+        McuCursor& cur = cursors[slot];
+        cur.pos = std::uint32_t(seg.packed_offset) + r.pos;
+        cur.nbits = r.nbits;
+        cur.buf = r.buf;
+        cur.p0 = pred[0];
+        cur.p1 = pred[1];
+        cur.p2 = pred[2];
+        cur.p3 = pred[3];
+        for (int b = 0; b < stream.blocks_in_mcu; ++b)
+        {
+            if (!cpuBlock(r, flat, dc_ti[b], ac_ti[b], pred[pred_i[b]]))
+            {
+                error = "Huffman run left the block";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// One MCU row per segment, in row order. Each row is an independent bitstream.
+bool oneRowRestarts(const mango::image::jpeg::EntropyStream& stream)
+{
+    if (stream.xmcu <= 0 || int(stream.segments.size()) != stream.ymcu || stream.ymcu < 2)
+        return false;
+    for (int y = 0; y < stream.ymcu; ++y)
+    {
+        const auto& seg = stream.segments[size_t(y)];
+        if (seg.mcu_y0 != y || seg.mcu_y1 != y + 1 || seg.mcus != stream.xmcu)
             return false;
     }
     return true;
@@ -1332,6 +1406,53 @@ bool buildCursors(const mango::image::jpeg::EntropyStream& stream, McuCursor* cu
         if (pi < 0 || pi > 3)
             pi = 3;
         pred_i[b] = pi;
+    }
+
+    // One restart per MCU row. Scan N rows per task (8..16) and hand each
+    // finished group to the GPU. The tasks do not share a bitstream.
+    if (oneRowRestarts(stream) && mango::ThreadPool::getHardwareConcurrency() > 1)
+    {
+        const int threads = int(mango::ThreadPool::getHardwareConcurrency());
+        int rows = stream.ymcu / std::max(threads, 1);
+        if (rows < 8)
+            rows = 8;
+        if (rows > 16)
+            rows = 16;
+        if (rows > stream.ymcu)
+            rows = stream.ymcu;
+
+        std::mutex error_mutex;
+        std::atomic<bool> failed { false };
+        mango::ConcurrentQueue queue("index-rst");
+        for (int y = 0; y < stream.ymcu; y += rows)
+        {
+            const int y0 = y;
+            const int y1 = std::min(y + rows, stream.ymcu);
+            queue.enqueue([&, y0, y1]
+            {
+                if (failed.load())
+                    return;
+                std::string local;
+                for (int row = y0; row < y1; ++row)
+                {
+                    if (!scanSegment(stream, flat, dc_ti, ac_ti, pred_i,
+                            stream.segments[size_t(row)], cursors, total, local))
+                    {
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (error.empty())
+                            error = std::move(local);
+                        failed.store(true);
+                        return;
+                    }
+                }
+                if (failed.load())
+                    return;
+                if (!on_batch(y0 * stream.xmcu, y1 * stream.xmcu))
+                    failed.store(true);
+            });
+        }
+        queue.wait();
+        return !failed.load();
     }
 
     for (const auto& seg : stream.segments)
