@@ -79,7 +79,7 @@ struct Args
     Backend backend = Backend::All;
     NvJpegModeSelect nvjpeg_mode = NvJpegModeSelect::Both;
     RocModeSelect roc_mode = RocModeSelect::Both;
-    int iterations = 1;
+    int count = 8;
     int warmup = 1;
     int inflight = 1;
     int pipeline_frames = 0;
@@ -163,8 +163,12 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.error = fmt::format("Invalid --roc-mode \"{}\" (hardware|hybrid|both)", value);
         });
 
-    commands.optionInt("--iterations", "timed present-path iterations after warmup (default 1)",
-        [&](int value) { args.iterations = std::max(1, value); });
+    commands.optionInt("--count", "timed runs per backend after warmup (default 8). "
+        "The scoreboard row is the mean of those runs with the slowest READY dropped",
+        [&](int value) { args.count = std::max(1, value); });
+
+    commands.optionInt("--iterations", "same sample count as --count",
+        [&](int value) { args.count = std::max(1, value); });
 
     commands.optionInt("--warmup", "discarded warm-up decodes before timing (default 1)",
         [&](int value) { args.warmup = std::max(0, value); });
@@ -439,6 +443,73 @@ struct BackendSlot
     bool ready = false;
 };
 
+// Arithmetic mean of the timed runs. The slowest successful READY is left out
+// when at least two runs succeeded, so one hitch does not move the row.
+PipelineResult meanDroppingSlowest(const std::string& name, const std::vector<PipelineResult>& samples)
+{
+    std::vector<const PipelineResult*> ok;
+    ok.reserve(samples.size());
+    for (const PipelineResult& sample : samples)
+    {
+        if (sample.ok)
+            ok.push_back(&sample);
+    }
+
+    if (ok.empty())
+    {
+        PipelineResult fail = samples.empty() ? PipelineResult{} : samples.back();
+        fail.backend = name;
+        printLine("{}: all {} runs failed", name, samples.size());
+        return fail;
+    }
+
+    const PipelineResult* dropped = nullptr;
+    if (ok.size() >= 2)
+    {
+        size_t slow = 0;
+        for (size_t i = 1; i < ok.size(); ++i)
+        {
+            if (ok[i]->ready_us >= ok[slow]->ready_us)
+                slow = i;
+        }
+        dropped = ok[slow];
+        ok.erase(ok.begin() + static_cast<std::ptrdiff_t>(slow));
+    }
+
+    auto meanOf = [&](u64 PipelineResult::* field) -> u64
+    {
+        double sum = 0.0;
+        for (const PipelineResult* sample : ok)
+            sum += double(sample->*field);
+        return u64(std::llround(sum / double(ok.size())));
+    };
+
+    PipelineResult mean = *ok.front();
+    mean.backend = name;
+    mean.milestones.clear();
+    mean.ready_us = meanOf(&PipelineResult::ready_us);
+    mean.decode_us = meanOf(&PipelineResult::decode_us);
+    mean.gpu_wait_us = meanOf(&PipelineResult::gpu_wait_us);
+    mean.promote_us = meanOf(&PipelineResult::promote_us);
+    mean.present_us = meanOf(&PipelineResult::present_us);
+    mean.e2e_us = meanOf(&PipelineResult::e2e_us);
+    mean.ok = true;
+    mean.error.clear();
+
+    if (dropped)
+    {
+        printLine("{}: mean of {} runs, dropped slowest READY {:.2f} ms",
+            name, ok.size(), dropped->ready_us / 1000.0);
+    }
+    const size_t used = ok.size() + (dropped ? 1 : 0);
+    if (used < samples.size())
+    {
+        printLine("{}: {} run(s) failed and were left out of the mean",
+            name, samples.size() - used);
+    }
+    return mean;
+}
+
 class BenchWindow : public VulkanWindow
 {
 public:
@@ -446,7 +517,7 @@ public:
     std::vector<Job> jobs;
     int content_w = 0;
     int content_h = 0;
-    int iterations = 1;
+    int count = 8;
     int pipeline_frames = 0;
     int inflight = 1;
     int warmup = 1;
@@ -846,12 +917,16 @@ public:
             }
 #endif
 
-            for (int iter = 0; iter < iterations; ++iter)
+            std::vector<PipelineResult> samples;
+            samples.reserve(size_t(count));
+            for (int iter = 0; iter < count; ++iter)
             {
                 auto r = runOne(job, slot, iter);
                 printPipeline(r);
-                results.push_back(std::move(r));
+                samples.push_back(std::move(r));
             }
+            results.push_back(meanDroppingSlowest(job.name, samples));
+            std::fflush(stdout);
         }
         std::fflush(stdout);
     }
@@ -1123,7 +1198,7 @@ public:
     PipelineResult runOne(const Job& job, BackendSlot& slot, int iter)
     {
         PipelineResult r;
-        r.backend = iterations > 1 ? fmt::format("{} [{}]", job.name, iter) : job.name;
+        r.backend = count > 1 ? fmt::format("{} [{}]", job.name, iter) : job.name;
 
         const u64 t0 = nowUs();
         addMilestone(r.milestones, "start", t0);
@@ -2526,7 +2601,7 @@ int main(int argc, const char* argv[])
 
     BenchWindow window(ctx, win_w, win_h, width, height, cuda_export, windowConfig);
     window.jpeg = jpeg;
-    window.iterations = args.iterations;
+    window.count = args.count;
     window.pipeline_frames = args.pipeline_frames;
     window.inflight = args.inflight;
     window.warmup = args.warmup;
@@ -2554,6 +2629,8 @@ int main(int argc, const char* argv[])
 
     printLine("==================================================");
     printLine("Primary metric: READY = start -> VkImage usable");
+    printLine("Scoreboard: mean of {} run(s), slowest READY dropped when more than one succeeded",
+        window.count);
     printLine("{:<22} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
         "backend", "READY", "decode", "promote", "present", "e2e", "path");
     printLine("");

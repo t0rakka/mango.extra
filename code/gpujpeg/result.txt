@@ -40,14 +40,14 @@ GPU: nVidia RTX 4070
 file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    11.36ms    4.76ms    5.74ms    0.51ms   11.87ms  host->VkImage
-mango-hybrid             21.30ms    2.94ms   18.37ms    0.26ms   25.93ms  file->VkImage
-mango-gpu                11.32ms    5.56ms    3.77ms    0.35ms   11.68ms  file->VkImage
-mango-gpu-index          44.88ms   39.93ms    3.29ms    0.59ms   45.47ms  file->VkImage
-nvjpeg-hybrid            12.98ms   11.38ms    1.60ms    0.47ms   13.46ms  file->VkImage
-nvjpeg-gpu               12.97ms   11.39ms    1.58ms   19.48ms   32.46ms  file->VkImage
-wic                      41.47ms   35.65ms    5.81ms    0.45ms   41.92ms  host->VkImage
-turbojpeg                37.02ms   31.17ms    5.85ms    0.60ms   37.63ms  host->VkImage
+mango                    10.75ms    3.82ms    6.04ms    0.66ms   11.41ms  host->VkImage
+mango-hybrid             25.72ms    2.46ms   23.26ms    0.36ms   34.61ms  file->VkImage
+mango-gpu                10.70ms    5.25ms    3.80ms    0.60ms   11.30ms  file->VkImage
+mango-gpu-index          16.86ms    8.75ms    7.99ms    0.41ms   17.27ms  file->VkImage
+nvjpeg-hybrid            12.18ms   10.72ms    1.45ms    0.40ms   12.58ms  file->VkImage
+nvjpeg-gpu               12.14ms   10.65ms    1.49ms    5.39ms   17.54ms  file->VkImage
+wic                      43.25ms   37.14ms    6.10ms    0.56ms   43.81ms  host->VkImage
+turbojpeg                35.68ms   29.57ms    6.11ms    0.59ms   36.28ms  host->VkImage
 
 file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
@@ -55,7 +55,7 @@ backend                    READY    decode   promote   present       e2e  path
 mango                    40.99ms   33.97ms    6.06ms    0.39ms   41.38ms  host->VkImage
 mango-hybrid             32.58ms   29.66ms    2.91ms    0.29ms   36.92ms  file->VkImage
 mango-gpu               381.96ms  377.78ms    2.90ms    0.20ms  382.16ms  file->VkImage
-mango-gpu-index          39.01ms   35.34ms    2.48ms    0.26ms   39.27ms  file->VkImage
+mango-gpu-index          36.84ms   26.07ms    1.79ms    0.45ms   37.30ms  file->VkImage
 nvjpeg-hybrid            12.08ms   10.71ms    1.37ms    0.39ms   12.47ms  file->VkImage
 nvjpeg-gpu               12.14ms   10.92ms    1.22ms   21.17ms   33.31ms  file->VkImage
 wic                      48.62ms   41.88ms    6.73ms    0.50ms   49.12ms  host->VkImage
