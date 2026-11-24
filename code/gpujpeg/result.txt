@@ -76,30 +76,30 @@ GPU: nVidia RTX 4090
 file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    14.32ms    2.33ms    3.88ms    2.85ms   17.18ms  host->VkImage
-mango-hybrid              7.71ms    1.58ms    6.13ms    0.40ms   20.72ms  file->VkImage
-mango-gpu                 9.06ms    3.09ms    1.82ms    0.23ms    9.30ms  file->VkImage
-mango-gpu-index          14.00ms    6.29ms    6.84ms    0.38ms   14.38ms  file->VkImage
-mango-gpu2               TODO
-nvjpeg-hybrid            11.37ms    9.19ms    2.18ms    0.19ms   11.56ms  file->VkImage
-nvjpeg-gpu               10.06ms    9.05ms    1.01ms    0.17ms   10.23ms  file->VkImage
-intel-vpl               506.61ms  500.88ms    5.71ms    0.39ms  507.00ms  igpu->VkImage
-wic                      42.41ms   36.22ms    6.17ms    0.44ms   42.85ms  host->VkImage
-turbojpeg                35.53ms   29.46ms    6.06ms    0.33ms   35.87ms  host->VkImage
+mango                     6.52ms    2.07ms    3.66ms    0.23ms    6.75ms  host->VkImage
+mango-hybrid             14.96ms    1.68ms   13.29ms    0.20ms   20.06ms  file->VkImage
+mango-gpu                 5.78ms    2.93ms    1.94ms    0.26ms    6.04ms  file->VkImage
+mango-gpu-index           9.52ms    6.17ms    6.71ms    0.23ms    9.75ms  file->VkImage
+mango-gpu2                1.68ms    0.64ms    0.00ms    0.19ms    1.87ms  file->VkImage
+nvjpeg-hybrid            10.35ms    9.34ms    1.00ms    0.14ms   10.48ms  file->VkImage
+nvjpeg-gpu               10.11ms    9.10ms    1.01ms    0.14ms   10.26ms  file->VkImage
+intel-vpl                14.68ms   10.23ms    4.45ms    0.16ms   14.85ms  igpu->VkImage
+wic                      40.33ms   36.35ms    3.97ms    0.24ms   40.57ms  host->VkImage
+turbojpeg                33.30ms   29.24ms    4.07ms    0.25ms   33.56ms  host->VkImage
 
 file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    32.99ms   21.38ms    4.37ms    2.63ms   35.63ms  host->VkImage
-mango-hybrid             20.04ms   18.08ms    1.96ms    0.38ms   31.97ms  file->VkImage
-mango-gpu               365.02ms  358.87ms    1.81ms    0.41ms  365.42ms  file->VkImage
-mango-gpu-index          31.66ms   24.89ms    1.59ms    0.28ms   31.94ms  file->VkImage
-mango-gpu2               TODO
-nvjpeg-hybrid            11.42ms    9.24ms    2.18ms    0.18ms   11.61ms  file->VkImage
-nvjpeg-gpu               10.00ms    9.06ms    0.94ms    0.17ms   10.17ms  file->VkImage
-intel-vpl               156.35ms  151.29ms    5.05ms    0.35ms  156.70ms  igpu->VkImage
-wic                      36.37ms   32.42ms    3.95ms    0.42ms   36.80ms  host->VkImage
-turbojpeg                31.62ms   27.16ms    4.46ms    0.40ms   32.02ms  host->VkImage
+mango                    27.75ms   22.93ms    4.01ms    0.16ms   27.91ms  host->VkImage
+mango-hybrid             20.96ms   18.86ms    2.10ms    0.22ms   26.92ms  file->VkImage
+mango-gpu               352.19ms  348.60ms    1.84ms    0.37ms  352.56ms  file->VkImage
+mango-gpu-index          28.15ms   25.42ms    1.61ms    0.29ms   28.44ms  file->VkImage
+mango-gpu2                1.58ms    0.63ms    0.00ms    0.23ms    1.81ms  file->VkImage
+nvjpeg-hybrid            10.26ms    9.31ms    0.94ms    0.13ms   10.39ms  file->VkImage
+nvjpeg-gpu               10.17ms    9.22ms    0.94ms    0.14ms   10.31ms  file->VkImage
+intel-vpl                18.22ms   13.97ms    4.24ms    0.17ms   18.39ms  igpu->VkImage
+wic                      40.95ms   36.91ms    4.03ms    0.25ms   41.20ms  host->VkImage
+turbojpeg                31.79ms   27.69ms    4.09ms    0.22ms   32.02ms  host->VkImage
 
 ---------------------------------------------------------------------------------------------------------
 OS: Arch Linux
