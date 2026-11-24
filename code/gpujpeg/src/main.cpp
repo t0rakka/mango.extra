@@ -1937,9 +1937,16 @@ public:
 
         // SIMD decode into cached memory. The staging buffer is write-combined;
         // decoding into it directly is several times slower than one streaming copy.
+        // GPUJPEG_DIRECT_STAGING=1 times the alternative: Surface aimed at host_mapped.
         u64 decode_us = 0;
-        host_rgba.resize(texture.rgba_bytes);
-        if (!decodeMangoTo(jpeg, host_rgba.data(), texture.width, texture.height, decode_us, error))
+        const bool direct_staging = std::getenv("GPUJPEG_DIRECT_STAGING") != nullptr;
+        void* decode_dest = texture.host_mapped;
+        if (!direct_staging)
+        {
+            host_rgba.resize(texture.rgba_bytes);
+            decode_dest = host_rgba.data();
+        }
+        if (!decodeMangoTo(jpeg, decode_dest, texture.width, texture.height, decode_us, error))
         {
             r.error = error;
             return r;
@@ -1951,7 +1958,8 @@ public:
         addMilestone(r.milestones, "decoded", t0);
 
         const u64 t_up0 = nowUs();
-        std::memcpy(texture.host_mapped, host_rgba.data(), texture.rgba_bytes);
+        if (!direct_staging)
+            std::memcpy(texture.host_mapped, host_rgba.data(), texture.rgba_bytes);
         if (!texture.flushCopyHostToImage(graphicsQueue(), graphicsQueueFamilyIndex(), error))
         {
             r.error = error;
