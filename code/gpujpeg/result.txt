@@ -116,7 +116,7 @@ mango                    11.37ms    2.43ms    6.41ms    0.82ms   12.18ms  host->
 mango-hybrid              7.30ms    1.90ms    5.40ms    0.17ms   13.44ms  file->VkImage
 mango-gpu               NOTE: blacklisted (RADV driver shared memory bug: sync failure)
 mango-gpu-index          24.67ms   17.10ms   16.75ms    0.12ms   24.80ms  file->VkImage
-mango-gpu2                2.35ms    1.60ms    0.00ms    0.11ms    2.45ms  file->VkImage
+mango-gpu2                1.27ms    1.22ms    0.00ms    0.10ms    1.38ms  file->VkImage
 roc-hardware             70.78ms   68.44ms    2.34ms    0.10ms   70.89ms  file->VkImage
 turbojpeg                30.31ms   24.74ms    5.57ms    0.10ms   30.41ms  host->VkImage
 
@@ -127,7 +127,7 @@ mango                    35.48ms   26.93ms    6.30ms    0.91ms   36.40ms  host->
 mango-hybrid             22.69ms   22.12ms    0.57ms    0.18ms   33.59ms  file->VkImage
 mango-gpu               NOTE: blacklisted (RADV driver shared memory bug: sync failure)
 mango-gpu-index          29.66ms   21.53ms    1.16ms    0.12ms   29.77ms  file->VkImage
-mango-gpu2                2.37ms    1.58ms    0.00ms    0.11ms    2.48ms  file->VkImage
+mango-gpu2                1.32ms    1.26ms    0.00ms    0.09ms    1.42ms  file->VkImage
 roc-hardware             66.56ms   64.33ms    2.23ms    0.12ms   66.69ms  file->VkImage
 turbojpeg                29.88ms   24.11ms    5.76ms    0.12ms   29.99ms  host->VkImage
 
