@@ -54,7 +54,10 @@ private:
     mango::ConstMemory m_jpeg;
     bool m_pipeline = false;
     bool m_static_copied = false;
-    bool m_linear = false;  // IDCT writes the texture's publish buffer, then one copy into the image
+    bool m_linear = false;
+    int m_ntables = 0;
+    int m_sync_wg = 128;
+    int m_write_wg = 128;  // IDCT writes the texture's publish buffer, then one copy into the image
     int m_nblk = 0;
     int m_nsegs = 0;
     std::uint32_t m_nwords = 0;

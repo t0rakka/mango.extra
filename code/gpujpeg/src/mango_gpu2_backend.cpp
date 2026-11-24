@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -22,7 +23,6 @@ constexpr int kNcp = 7;
 constexpr int kPieces = kNcp + 1;
 constexpr std::uint32_t kChunkBits = 2048;
 constexpr int kMaxPasses = 8;
-constexpr int kSyncRounds = 128;
 
 constexpr int kBindings = 17;
 constexpr std::uint32_t kImageBinding = 14;
@@ -118,23 +118,23 @@ layout(push_constant) uniform Push {
 )glsl";
 
 constexpr char kHuffman[] = R"glsl(
-shared uint slut[4096];
-shared int smaxc[144];
-shared int svoff[144];
-shared uint shv[512];
+shared uint slut[NT * 512];
+shared int smaxc[NT * 18];
+shared int svoff[NT * 18];
+shared uint shv[NT * 64];
 
 void loadTabs()
 {
     uint t = gl_LocalInvocationIndex;
     uint n = gl_WorkGroupSize.x;
-    for (uint i = t; i < 4096u; i += n)
+    for (uint i = t; i < uint(NT * 512); i += n)
         slut[i] = tlut[i];
-    for (uint i = t; i < 144u; i += n)
+    for (uint i = t; i < uint(NT * 18); i += n)
     {
         smaxc[i] = tmaxc[i];
         svoff[i] = tvoff[i];
     }
-    for (uint i = t; i < 512u; i += n)
+    for (uint i = t; i < uint(NT * 64); i += n)
         shv[i] = thv[i];
     barrier();
 }
@@ -221,9 +221,9 @@ uvec2 pack(uint pos, int c, int z)
 )glsl";
 
 constexpr char kSyncMain[] = R"glsl(
-layout(local_size_x = 128) in;
+layout(local_size_x = SYNC_WG) in;
 
-shared uvec2 so[128];
+shared uvec2 so[SYNC_WG];
 shared uint anyCh;
 
 // Walk from (pos, c, z) to end, recording the state at the first symbol
@@ -272,7 +272,7 @@ void main()
     loadTabs();
 
     int tid = int(gl_LocalInvocationID.x);
-    int i = int(gl_WorkGroupID.x) * 128 + tid;
+    int i = int(gl_WorkGroupID.x) * SYNC_WG + tid;
     bool valid = i < pc.nch;
     bool known = !valid || chunks[i].bit0 == chunks[i].seg0;
     uint cpBase = uint(max(i, 0)) * 7u;
@@ -350,7 +350,7 @@ void main()
         stOut[i] = myOut;
         cnt[i] = n;
     }
-    int last = min(128, pc.nch - int(gl_WorkGroupID.x) * 128) - 1;
+    int last = min(SYNC_WG, pc.nch - int(gl_WorkGroupID.x) * SYNC_WG) - 1;
     if (tid == last && (myOut != out0 || more || (pc.pass == 0 && gl_NumWorkGroups.x > 1u)))
         flags[pc.pass] = 1u;
 }
@@ -395,7 +395,7 @@ void main()
 )glsl";
 
 constexpr char kWriteMain[] = R"glsl(
-layout(local_size_x = 128) in;
+layout(local_size_x = WRITE_WG) in;
 
 // A block belongs to the piece its DC symbol starts in: a piece first skips
 // the rest of a block begun before it, and finishes its own last block past
@@ -975,15 +975,29 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     TablesGpu tab = {};
     std::vector<std::uint16_t> lut(8 * kLut, 0);
     std::vector<std::uint8_t> hv(8 * 256, 0);
+    int slot_of[8];
+    for (int i = 0; i < 8; ++i)
+        slot_of[i] = -1;
+    m_ntables = 0;
+    for (int b = 0; b < bpm; ++b)
+    {
+        const int used[2] = { stream.block[b].dc & 3, 4 + (stream.block[b].ac & 3) };
+        for (int u : used)
+        {
+            if (slot_of[u] < 0)
+                slot_of[u] = m_ntables++;
+        }
+    }
     for (const auto& table : stream.huffman)
     {
-        const int slot = table.cls * 4 + table.id;
-        if (slot < 0 || slot >= 8)
+        const int id = table.cls * 4 + table.id;
+        if (id < 0 || id >= 8)
         {
             error = "Huffman table id is outside 0..3";
             return false;
         }
-        buildSlot(table, table.cls == 0, lut, hv, tab, slot);
+        if (slot_of[id] >= 0)
+            buildSlot(table, table.cls == 0, lut, hv, tab, slot_of[id]);
     }
     for (int i = 0; i < 8 * kLut / 2; ++i)
         tab.lut[i] = std::uint32_t(lut[2 * i]) | (std::uint32_t(lut[2 * i + 1]) << 16);
@@ -997,8 +1011,8 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     for (int b = 0; b < bpm; ++b)
     {
         const auto& info = stream.block[b];
-        m_dc_pack |= std::uint32_t(info.dc & 7) << (3 * b);
-        m_ac_pack |= std::uint32_t((4 + info.ac) & 7) << (3 * b);
+        m_dc_pack |= std::uint32_t(slot_of[info.dc & 3]) << (3 * b);
+        m_ac_pack |= std::uint32_t(slot_of[4 + (info.ac & 3)]) << (3 * b);
         m_comp_pack |= std::uint32_t(info.component & 3) << (2 * b);
     }
 
@@ -1149,11 +1163,16 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
 {
     const mango::u64 t_compile = nowUs();
     m_linear = bool(texture.publish_alloc);
+    if (const char* s = std::getenv("GPU2_SYNC_WG"))
+        m_sync_wg = std::atoi(s);
+    if (const char* s = std::getenv("GPU2_WRITE_WG"))
+        m_write_wg = std::atoi(s);
+    const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n";
     mango::vulkan::Compiler compiler;
     const std::string sources[PipeCount] = {
-        std::string(kCommon) + kHuffman + kSyncMain,
+        std::string(kCommon) + defs + "#define SYNC_WG " + std::to_string(m_sync_wg) + "\n" + kHuffman + kSyncMain,
         std::string(kCommon) + kPrefixMain,
-        std::string(kCommon) + kHuffman + kWriteMain,
+        std::string(kCommon) + defs + "#define WRITE_WG " + std::to_string(m_write_wg) + "\n" + kHuffman + kWriteMain,
         std::string(kCommon) + kDcScan + kDcLocalMain,
         std::string(kCommon) + kDcScan + kDcGroupsMain,
         std::string(kCommon) + (m_linear ? "#define LINEAR_OUT 1\n" : "") + kIdctMain,
@@ -1362,7 +1381,7 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     const mango::image::jpeg::JpegInfo& info = info_decoder.info();
     Push push = {};
     push.nch = chunks;
-    push.rounds = kSyncRounds;
+    push.rounds = m_sync_wg;
     push.bpm = stream.blocks_in_mcu;
     push.dc_pack = m_dc_pack;
     push.ac_pack = m_ac_pack;
@@ -1446,7 +1465,8 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
         vkCmdDispatch(cmd, std::max(groups, 1u), 1, 1);
     };
 
-    const std::uint32_t sync_groups = (std::uint32_t(chunks) + 127u) / 128u;
+    const std::uint32_t sync_wg = std::uint32_t(m_sync_wg);
+    const std::uint32_t sync_groups = (std::uint32_t(chunks) + sync_wg - 1u) / sync_wg;
     for (int pass = 0; pass < kMaxPasses; ++pass)
     {
         push.pass = pass;
@@ -1457,7 +1477,7 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     dispatch(PipePrefix, std::uint32_t(m_nsegs));
     computeBarrier(cmd);
     stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 3);
-    dispatch(PipeWrite, (std::uint32_t(chunks) * kPieces + 127u) / 128u);
+    dispatch(PipeWrite, (std::uint32_t(chunks) * kPieces + std::uint32_t(m_write_wg) - 1u) / std::uint32_t(m_write_wg));
     computeBarrier(cmd);
     stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 4);
     {
