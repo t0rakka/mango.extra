@@ -87,6 +87,7 @@ struct Args
     int pipeline_frames = 0;
     bool validate = false;
     bool keep_open = false;
+    bool auto_exit = false;
     bool hybrid_floor = false; // Huffman-only floor (skip VK compute)
     std::string error;
 };
@@ -189,6 +190,9 @@ void configureParser(const CommandLine& commands, Args& args)
 
     commands.flag("--keep-open", "legacy no-op (window always stays open; ESC quits)",
         [&]() { args.keep_open = true; });
+
+    commands.flag("--exit", "quit after the benchmark instead of waiting for ESC",
+        [&]() { args.auto_exit = true; });
 
     commands.flag("--hybrid-floor", "hybrid: Huffman only (no VK compute) — measure floor",
         [&]() { args.hybrid_floor = true; });
@@ -537,6 +541,7 @@ public:
     std::vector<u8> host_rgba; // cached RGBA for the CPU decode; staging is write-combined
     std::vector<PipelineResult> results;
     bool first_frame_done = false;
+    bool auto_exit = false;
     int grid_cols = 1;
     int grid_rows = 1;
 
@@ -650,6 +655,8 @@ public:
             runJobs();
             setTitle(fmt::format("gpujpeg {}x{} grid (ESC quit)", grid_cols, grid_rows));
             presentGrid();
+            if (auto_exit)
+                requestQuit();
             return;
         }
 
@@ -2717,6 +2724,7 @@ int main(int argc, const char* argv[])
     BenchWindow window(ctx, win_w, win_h, width, height, cuda_export, windowConfig);
     window.jpeg = jpeg;
     window.count = args.count;
+    window.auto_exit = args.auto_exit;
     window.pipeline_frames = args.pipeline_frames;
     window.inflight = args.inflight;
     window.warmup = args.warmup;

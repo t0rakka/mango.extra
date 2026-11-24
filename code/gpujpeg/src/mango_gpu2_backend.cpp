@@ -20,9 +20,10 @@ namespace
 
 constexpr int kLb = 10;
 constexpr int kLut = 1 << kLb;
-constexpr int kNcp = 7;
+constexpr int kNcp = 1;
 constexpr int kPieces = kNcp + 1;
-constexpr std::uint32_t kChunkBits = 2048;
+constexpr std::uint32_t kChunkBits = 1024;
+constexpr std::uint32_t kPieceBits = kChunkBits / kPieces;
 constexpr int kMaxPasses = 8;
 
 constexpr int kBindings = 17;
@@ -54,10 +55,10 @@ struct SegGpu
 // thing fits in shared memory next to the sync state.
 struct TablesGpu
 {
-    std::uint32_t lut[8 * kLut / 2];
     std::int32_t maxc[8 * 18];
     std::int32_t voff[8 * 18];
     std::uint32_t hv[8 * 256 / 4];
+    std::uint32_t lut[8 * kLut / 2];
 };
 
 using Push = Gpu2Push;
@@ -70,7 +71,7 @@ struct Chunk { uint bit0; uint bit1; uint seg0; uint seg1; int block0; int block
 layout(std430, binding = 1) readonly buffer Chunks { Chunk chunks[]; };
 struct Seg { int chunk0; int nchunks; int block0; int mcu0; int mcus; };
 layout(std430, binding = 2) readonly buffer Segs { Seg segs[]; };
-layout(std430, binding = 3) readonly buffer Tables { uint tlut[4096]; int tmaxc[144]; int tvoff[144]; uint thv[512]; };
+layout(std430, binding = 3) readonly buffer Tables { int tmaxc[144]; int tvoff[144]; uint thv[512]; uint tlut[]; };
 layout(std430, binding = 4) buffer StIn { uvec2 stIn[]; };
 layout(std430, binding = 5) buffer StOut { uvec2 stOut[]; };
 layout(std430, binding = 6) buffer Cnt { int cnt[]; };
@@ -103,7 +104,7 @@ layout(push_constant) uniform Push {
 )glsl";
 
 constexpr char kHuffman[] = R"glsl(
-shared uint slut[NT * 512];
+shared uint slut[NT << (LB - 1)];
 shared int smaxc[NT * 18];
 shared int svoff[NT * 18];
 shared uint shv[NT * 64];
@@ -112,7 +113,7 @@ void loadTabs()
 {
     uint t = gl_LocalInvocationIndex;
     uint n = uint(HUFF_WG);
-    for (uint i = t; i < uint(NT * 512); i += n)
+    for (uint i = t; i < uint(NT << (LB - 1)); i += n)
         slut[i] = tlut[i];
     for (uint i = t; i < uint(NT * 18); i += n)
     {
@@ -161,13 +162,13 @@ int symEntry(int sym, int len, bool dc)
 
 int hent(int ti, uint bits, bool dc)
 {
-    int idx = (ti << 10) | int(bits >> 22);
+    int idx = (ti << LB) | int(bits >> (32 - LB));
     uint w = slut[idx >> 1];
     int e = int((idx & 1) != 0 ? (w >> 16) : (w & 0xffffu));
     if (e != 0)
         return e;
-    int l = 11;
-    int code = int(bits >> 21);
+    int l = LB + 1;
+    int code = int(bits >> (31 - LB));
     while (l <= 16 && code > smaxc[ti * 18 + l])
     {
         ++l;
@@ -212,15 +213,15 @@ shared uvec2 so[SYNC_WG];
 shared uint anyCh;
 
 // Walk from (pos, c, z) to end, recording the state at the first symbol
-// boundary past each 256-bit mark. With cmp, stop at the first mark whose
+// boundary past each PIECE_BITS mark. With cmp, stop at the first mark whose
 // state matches this chunk's previous walk and shift the later block counts.
 bool runChunk(inout Rd r, inout uint pos, inout int c, inout int z, uint base, uint end,
               uint cpBase, inout int n, bool cmp)
 {
     int done = 0;
-    for (int j = 0; j <= 7; ++j)
+    for (int j = 0; j <= NCP; ++j)
     {
-        uint mark = j < 7 ? min(base + uint((j + 1) * 256), end) : end;
+        uint mark = j < NCP ? min(base + uint((j + 1) * PIECE_BITS), end) : end;
         while (pos < mark)
         {
             stepSkip(r, pos, c, z);
@@ -231,14 +232,14 @@ bool runChunk(inout Rd r, inout uint pos, inout int c, inout int z, uint base, u
                 ++done;
             }
         }
-        if (j == 7)
+        if (j == NCP)
             break;
         uvec2 st = pack(pos, c, z);
         uint at = cpBase + uint(j);
         if (cmp && st == cps[at])
         {
             int shift = done - cpc[at];
-            for (int k = j; k < 7; ++k)
+            for (int k = j; k < NCP; ++k)
                 cpc[cpBase + uint(k)] += shift;
             n += shift;
             return true;
@@ -260,7 +261,7 @@ void main()
     int i = int(gl_WorkGroupID.x) * SYNC_WG + tid;
     bool valid = i < pc.nch;
     bool known = !valid || chunks[i].bit0 == chunks[i].seg0;
-    uint cpBase = uint(max(i, 0)) * 7u;
+    uint cpBase = uint(max(i, 0)) * uint(NCP);
 
     Rd r;
     uvec2 myIn = uvec2(0u);
@@ -344,6 +345,10 @@ void main()
 constexpr char kPrefixMain[] = R"glsl(
 layout(local_size_x = 256) in;
 
+// Each lane owns PK consecutive chunks, so a whole-file segment (one serial
+// scan) takes a handful of tiles instead of one per 256 chunks.
+const int PK = 16;
+
 shared int sh[256];
 shared int run;
 
@@ -354,26 +359,37 @@ void main()
     if (t == 0u)
         run = 0;
     barrier();
-    for (int tile = 0; tile < s.nchunks; tile += 256)
+    for (int tile = 0; tile < s.nchunks; tile += 256 * PK)
     {
-        int ci = tile + int(t);
-        int n = ci < s.nchunks ? cnt[s.chunk0 + ci] : 0;
-        sh[t] = n;
+        int c0 = tile + int(t) * PK;
+        int v[PK];
+        int sum = 0;
+        for (int k = 0; k < PK; ++k)
+        {
+            v[k] = c0 + k < s.nchunks ? cnt[s.chunk0 + c0 + k] : 0;
+            sum += v[k];
+        }
+        sh[t] = sum;
         barrier();
         for (uint off = 1u; off < 256u; off <<= 1u)
         {
-            int v = sh[t];
+            int x = sh[t];
             if (t >= off)
-                v += sh[t - off];
+                x += sh[t - off];
             barrier();
-            sh[t] = v;
+            sh[t] = x;
             barrier();
         }
-        if (ci < s.nchunks)
-            firstb[s.chunk0 + ci] = s.block0 + run + sh[t] - n;
+        int b = s.block0 + run + sh[t] - sum;
+        for (int k = 0; k < PK; ++k)
+        {
+            if (c0 + k < s.nchunks)
+                firstb[s.chunk0 + c0 + k] = b;
+            b += v[k];
+        }
         barrier();
         if (t == 0u)
-            run += sh[min(255, s.nchunks - tile - 1)];
+            run += sh[255];
         barrier();
     }
 }
@@ -390,78 +406,88 @@ void main()
 {
     loadTabs();
     int gi = int(gl_GlobalInvocationID.x);
-    int i = gi >> 3;
-    int piece = gi & 7;
+    int i = gi / (NCP + 1);
+    int piece = gi - i * (NCP + 1);
     if (i >= pc.nch)
         return;
     Chunk ch = chunks[i];
-    uvec2 s = piece == 0 ? stIn[i] : cps[uint(i) * 7u + uint(piece - 1)];
+    uvec2 s = piece == 0 ? stIn[i] : cps[uint(i * NCP + piece - 1)];
     uint pos = s.x;
     int bc = int((s.y >> 8) & 255u);
     int z = int(s.y & 255u);
-    int B = firstb[i] + (piece == 0 ? 0 : cpc[i * 7 + piece - 1]);
-    uint mark = piece < 7 ? min(ch.bit0 + uint((piece + 1) * 256), ch.bit1) : ch.bit1;
+    int B = firstb[i] + (piece == 0 ? 0 : cpc[i * NCP + piece - 1]);
+    uint mark = piece < NCP ? min(ch.bit0 + uint((piece + 1) * PIECE_BITS), ch.bit1) : ch.bit1;
 
+    // One loop per symbol, block ends handled inline: a per-block inner loop
+    // holds every lane of the subgroup until its longest block is done.
+    bool skip = z != 0;
+    if (!skip && !(pos < mark && B < ch.block1))
+        return;
     Rd r;
     seek(r, pos);
-    if (z != 0)
+    uint base = uint(B) * 32u;
+    int dcv = 0;
+    uint pend = 0u;
+    uint w0 = 0u;
+    int pq = 0;
+    for (;;)
     {
-        while (z < 64)
-            stepSkip(r, pos, bc, z);
-        z = 0;
-        bc = nextBlock(bc);
-        ++B;
-    }
-    while (pos < mark && B < ch.block1)
-    {
-        uint base = uint(B) * 32u;
-        int dcv = 0;
-        uint pend = 0u;
-        uint w0 = 0u;
-        int pq = 0;
-        do
+        uint bits = peek(r, pos);
+        bool dc = z == 0;
+        int h = hent(tableOf(bc, dc), bits, dc);
+        int tot = h & 31;
+        int sz = (h >> 5) & 15;
+        int za = (h >> 9) & 127;
+        if (sz != 0 && !skip)
         {
-            uint bits = peek(r, pos);
-            bool dc = z == 0;
-            int h = hent(tableOf(bc, dc), bits, dc);
-            int tot = h & 31;
-            int sz = (h >> 5) & 15;
-            int za = (h >> 9) & 127;
-            if (sz != 0)
+            int v = int((bits << uint(tot - sz)) >> uint(32 - sz));
+            if (v < (1 << (sz - 1)))
+                v = v - (1 << sz) + 1;
+            int zi = z + za - 1;
+            if (dc)
+                dcv = v;
+            else if (zi < 64)
             {
-                int v = int((bits << uint(tot - sz)) >> uint(32 - sz));
-                if (v < (1 << (sz - 1)))
-                    v = v - (1 << sz) + 1;
-                int zi = z + za - 1;
-                if (dc)
-                    dcv = v;
-                else if (zi < 64)
+                int q = zi >> 1;
+                if (q != pq)
                 {
-                    int q = zi >> 1;
-                    while (pq < q)
-                    {
-                        if (pq == 0)
-                            w0 = pend;
-                        else
-                            coef[base + uint(pq)] = pend;
-                        pend = 0u;
-                        ++pq;
-                    }
-                    pend |= (uint(v) & 0xffffu) << (uint(zi & 1) * 16u);
+                    if (pq == 0)
+                        w0 = pend;
+                    else
+                        coef[base + uint(pq)] = pend;
+                    for (int k = pq + 1; k < q; ++k)
+                        coef[base + uint(k)] = 0u;
+                    pend = 0u;
+                    pq = q;
                 }
+                pend |= (uint(v) & 0xffffu) << (uint(zi & 1) * 16u);
             }
-            pos += uint(tot);
-            z += za;
-        } while (z < 64);
-        if (pq == 0)
-            w0 = pend;
-        else
-            coef[base + uint(pq)] = pend;
-        coef[base] = (w0 & 0xffff0000u) | uint(pq + 1);
-        dcd[B] = dcv;
-        z = 0;
-        bc = nextBlock(bc);
-        ++B;
+        }
+        pos += uint(tot);
+        z += za;
+        if (z >= 64)
+        {
+            if (!skip)
+            {
+                if (pq == 0)
+                    w0 = pend;
+                else
+                    coef[base + uint(pq)] = pend;
+                coef[base] = (w0 & 0xffff0000u) | uint(pq + 1);
+                dcd[B] = dcv;
+            }
+            skip = false;
+            z = 0;
+            bc = nextBlock(bc);
+            ++B;
+            if (!(pos < mark && B < ch.block1))
+                break;
+            base = uint(B) * 32u;
+            dcv = 0;
+            pend = 0u;
+            w0 = 0u;
+            pq = 0;
+        }
     }
 }
 )glsl";
@@ -600,11 +626,19 @@ const int zigzag[64] = int[](
     53, 60, 61, 54, 47, 55, 62, 63
 );
 
+layout(std430, binding = 10) readonly buffer Coef4 { uvec4 coef4[]; };
+
 // 32 block slots of 8 lanes. nat holds dezigzag'd coeffs, then the finished
 // samples. The frame layout (BPM, XB, YB, *_H, *_V, *_OFF, *_QT, NCOMP, MPG)
 // is compiled in so the per-pixel sampling math is shifts and constants.
-shared int nat[32 * 64];
-shared int tmp[32 * 64];
+// Rows are 9 words and blocks 72, so the 8 lanes of a block reading a column
+// or writing a row, and the 4 blocks of a 32-wide subgroup, hit distinct banks.
+// Both IDCT passes work in place (read to registers, barrier, write back):
+// a second array costs more in occupancy than the extra barriers.
+const int RS = 9;
+const int BS = 8 * RS;
+shared int nat[32 * BS];
+shared ivec2 origin[MPG];
 
 void idct_pass(inout int x0, inout int x1, inout int x2, inout int x3,
                inout int y0, inout int y1, inout int y2, inout int y3,
@@ -664,7 +698,7 @@ int sample_at(int mcu_local, int first_block, int hsf, int vsf, int lx, int ly)
     int spx = ((lx % block_w) * 8) / block_w;
     int spy = ((ly % block_h) * 8) / block_h;
     int block = mcu_local * BPM + first_block + by * hsf + bx;
-    return nat[block * 64 + spy * 8 + spx];
+    return nat[block * BS + spy * RS + spx];
 }
 
 void main()
@@ -678,9 +712,15 @@ void main()
     int mcu_local = slot / BPM;
     int b = slot - mcu_local * BPM;
     bool live = slot < used && (group0 + mcu_local) < pc.nmcu;
-    int dst = slot * 64;
+    int dst = slot * BS;
     int blk = (group0 + mcu_local) * BPM + b;
     int qbase = qt_index_of(b) * 64;
+
+    if (lane < MPG)
+    {
+        int m = group0 + lane;
+        origin[lane] = ivec2((m % pc.xmcu) * XB, (m / pc.xmcu) * YB);
+    }
 
     // Lane col owns zigzag positions col*8 .. col*8+7, i.e. words col*4 .. col*4+3.
     bool dcOnly = false;
@@ -694,32 +734,43 @@ void main()
         {
             int v = clamp_u8((((dc * qt[qbase]) << 2) * 4096 + 0x10000 + (128 << 17)) >> 17);
             for (int k = 0; k < 8; ++k)
-                nat[dst + col * 8 + k] = v;
+                nat[dst + col * RS + k] = v;
         }
         else
         {
+            uint w4 = uint(col * 4);
+            uvec4 w = w4 < nw ? coef4[uint(blk) * 8u + uint(col)] : uvec4(0u);
+            w = mix(uvec4(0u), w, lessThan(uvec4(w4) + uvec4(0u, 1u, 2u, 3u), uvec4(nw)));
             for (int k = 0; k < 4; ++k)
             {
-                uint wi = uint(col * 4 + k);
-                uint w = wi < nw ? coef[uint(blk) * 32u + wi] : 0u;
-                int i = int(wi) * 2;
-                nat[dst + zigzag[i]] = i == 0 ? dc : (int(w << 16) >> 16);
-                nat[dst + zigzag[i + 1]] = int(w) >> 16;
+                int i = col * 8 + k * 2;
+                int z0 = zigzag[i];
+                int z1 = zigzag[i + 1];
+                nat[dst + z0 + (z0 >> 3)] = i == 0 ? dc : (int(w[k] << 16) >> 16);
+                nat[dst + z1 + (z1 >> 3)] = int(w[k]) >> 16;
             }
         }
     }
     barrier();
 
-    if (live && !dcOnly)
+    bool idct = live && !dcOnly;
+    int n0 = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0, n5 = 0, n6 = 0, n7 = 0;
+    if (idct)
     {
-        int n0 = nat[dst + col];
-        int n1 = nat[dst + col + 8];
-        int n2 = nat[dst + col + 16];
-        int n3 = nat[dst + col + 24];
-        int n4 = nat[dst + col + 32];
-        int n5 = nat[dst + col + 40];
-        int n6 = nat[dst + col + 48];
-        int n7 = nat[dst + col + 56];
+        n0 = nat[dst + col];
+        n1 = nat[dst + col + RS];
+        n2 = nat[dst + col + RS * 2];
+        n3 = nat[dst + col + RS * 3];
+        n4 = nat[dst + col + RS * 4];
+        n5 = nat[dst + col + RS * 5];
+        n6 = nat[dst + col + RS * 6];
+        n7 = nat[dst + col + RS * 7];
+    }
+    barrier();
+
+    if (idct)
+    {
+        int t = dst + col * RS;
         if ((n1 | n2 | n3 | n4 | n5 | n6 | n7) != 0)
         {
             int x0, x1, x2, x3, y0, y1, y2, y3;
@@ -730,75 +781,103 @@ void main()
                 n6 * qt[qbase + col + 48], n7 * qt[qbase + col + 56]);
             const int bias = 0x200;
             x0 += bias; x1 += bias; x2 += bias; x3 += bias;
-            tmp[dst + col * 8 + 0] = (x0 + y3) >> 10;
-            tmp[dst + col * 8 + 1] = (x1 + y2) >> 10;
-            tmp[dst + col * 8 + 2] = (x2 + y1) >> 10;
-            tmp[dst + col * 8 + 3] = (x3 + y0) >> 10;
-            tmp[dst + col * 8 + 4] = (x3 - y0) >> 10;
-            tmp[dst + col * 8 + 5] = (x2 - y1) >> 10;
-            tmp[dst + col * 8 + 6] = (x1 - y2) >> 10;
-            tmp[dst + col * 8 + 7] = (x0 - y3) >> 10;
+            nat[t + 0] = (x0 + y3) >> 10;
+            nat[t + 1] = (x1 + y2) >> 10;
+            nat[t + 2] = (x2 + y1) >> 10;
+            nat[t + 3] = (x3 + y0) >> 10;
+            nat[t + 4] = (x3 - y0) >> 10;
+            nat[t + 5] = (x2 - y1) >> 10;
+            nat[t + 6] = (x1 - y2) >> 10;
+            nat[t + 7] = (x0 - y3) >> 10;
         }
         else
         {
             int dc = (n0 * qt[qbase + col]) << 2;
             for (int k = 0; k < 8; ++k)
-                tmp[dst + col * 8 + k] = dc;
+                nat[t + k] = dc;
         }
     }
     barrier();
 
-    if (live && !dcOnly)
+    if (idct)
     {
         int row = col;
-        int x0, x1, x2, x3, y0, y1, y2, y3;
-        idct_pass(x0, x1, x2, x3, y0, y1, y2, y3,
-            tmp[dst + row], tmp[dst + row + 8], tmp[dst + row + 16], tmp[dst + row + 24],
-            tmp[dst + row + 32], tmp[dst + row + 40], tmp[dst + row + 48], tmp[dst + row + 56]);
-        const int shift = 17;
-        const int bias = 0x10000 + (128 << shift);
-        x0 += bias; x1 += bias; x2 += bias; x3 += bias;
-        nat[dst + row * 8 + 0] = clamp_u8((x0 + y3) >> shift);
-        nat[dst + row * 8 + 1] = clamp_u8((x1 + y2) >> shift);
-        nat[dst + row * 8 + 2] = clamp_u8((x2 + y1) >> shift);
-        nat[dst + row * 8 + 3] = clamp_u8((x3 + y0) >> shift);
-        nat[dst + row * 8 + 4] = clamp_u8((x3 - y0) >> shift);
-        nat[dst + row * 8 + 5] = clamp_u8((x2 - y1) >> shift);
-        nat[dst + row * 8 + 6] = clamp_u8((x1 - y2) >> shift);
-        nat[dst + row * 8 + 7] = clamp_u8((x0 - y3) >> shift);
+        n0 = nat[dst + row];
+        n1 = nat[dst + row + RS];
+        n2 = nat[dst + row + RS * 2];
+        n3 = nat[dst + row + RS * 3];
+        n4 = nat[dst + row + RS * 4];
+        n5 = nat[dst + row + RS * 5];
+        n6 = nat[dst + row + RS * 6];
+        n7 = nat[dst + row + RS * 7];
     }
     barrier();
 
-    const int area = XB * YB;
-    for (int p = lane; p < MPG * area; p += 256)
+    if (idct)
     {
-        int mcu_i = p / area;
-        int pix = p - mcu_i * area;
-        int global_mcu = group0 + mcu_i;
-        if (global_mcu >= pc.nmcu)
+        int row = col;
+        int x0, x1, x2, x3, y0, y1, y2, y3;
+        idct_pass(x0, x1, x2, x3, y0, y1, y2, y3, n0, n1, n2, n3, n4, n5, n6, n7);
+        const int shift = 17;
+        const int bias = 0x10000 + (128 << shift);
+        x0 += bias; x1 += bias; x2 += bias; x3 += bias;
+        int o = dst + row * RS;
+        nat[o + 0] = clamp_u8((x0 + y3) >> shift);
+        nat[o + 1] = clamp_u8((x1 + y2) >> shift);
+        nat[o + 2] = clamp_u8((x2 + y1) >> shift);
+        nat[o + 3] = clamp_u8((x3 + y0) >> shift);
+        nat[o + 4] = clamp_u8((x3 - y0) >> shift);
+        nat[o + 5] = clamp_u8((x2 - y1) >> shift);
+        nat[o + 6] = clamp_u8((x1 - y2) >> shift);
+        nat[o + 7] = clamp_u8((x0 - y3) >> shift);
+    }
+    barrier();
+    // Each lane colours a horizontal pixel pair; a chroma block at least 16
+    // pixels wide gives both pixels of an (even-aligned) pair the same sample.
+    const int area2 = XB * YB / 2;
+    for (int p = lane; p < MPG * area2; p += 256)
+    {
+        int mcu_i = p / area2;
+        int pix = p - mcu_i * area2;
+        if (group0 + mcu_i >= pc.nmcu)
             continue;
-        int lx = pix % XB;
-        int ly = pix / XB;
-        int px = (global_mcu % pc.xmcu) * XB + lx;
-        int py = (global_mcu / pc.xmcu) * YB + ly;
+        int lx = (pix % (XB / 2)) * 2;
+        int ly = pix / (XB / 2);
+        int px = origin[mcu_i].x + lx;
+        int py = origin[mcu_i].y + ly;
         if (px >= pc.width || py >= pc.height)
             continue;
 
-        int Y = sample_at(mcu_i, Y_OFF, Y_H, Y_V, lx, ly);
-        int R, G, B;
+        int Y0 = sample_at(mcu_i, Y_OFF, Y_H, Y_V, lx, ly);
+        int Y1 = sample_at(mcu_i, Y_OFF, Y_H, Y_V, lx + 1, ly);
 #if NCOMP == 1
-        R = G = B = Y;
+        ivec3 c0 = ivec3(Y0);
+        ivec3 c1 = ivec3(Y1);
 #else
-        int Cb = sample_at(mcu_i, CB_OFF, CB_H, CB_V, lx, ly) - 128;
-        int Cr = sample_at(mcu_i, CR_OFF, CR_H, CR_V, lx, ly) - 128;
-        R = clamp_u8(Y + ((Cr * 91881) >> 16));
-        G = clamp_u8(Y - ((Cb * 22554 + Cr * 46802) >> 16));
-        B = clamp_u8(Y + ((Cb * 116130) >> 16));
+        int Cb0 = sample_at(mcu_i, CB_OFF, CB_H, CB_V, lx, ly) - 128;
+        int Cr0 = sample_at(mcu_i, CR_OFF, CR_H, CR_V, lx, ly) - 128;
+#if XB / CB_H >= 16
+        int Cb1 = Cb0;
+#else
+        int Cb1 = sample_at(mcu_i, CB_OFF, CB_H, CB_V, lx + 1, ly) - 128;
 #endif
-#ifdef LINEAR_OUT
-        rgbaOut[py * pc.width + px] = uint(R) | (uint(G) << 8) | (uint(B) << 16) | 0xff000000u;
+#if XB / CR_H >= 16
+        int Cr1 = Cr0;
 #else
-        imageStore(uOut, ivec2(px, py), vec4(float(R), float(G), float(B), 255.0) / 255.0);
+        int Cr1 = sample_at(mcu_i, CR_OFF, CR_H, CR_V, lx + 1, ly) - 128;
+#endif
+        ivec3 c0 = clamp(Y0 + ivec3((Cr0 * 91881) >> 16, -((Cb0 * 22554 + Cr0 * 46802) >> 16), (Cb0 * 116130) >> 16), 0, 255);
+        ivec3 c1 = clamp(Y1 + ivec3((Cr1 * 91881) >> 16, -((Cb1 * 22554 + Cr1 * 46802) >> 16), (Cb1 * 116130) >> 16), 0, 255);
+#endif
+        bool second = px + 1 < pc.width;
+#ifdef LINEAR_OUT
+        rgbaOut[py * pc.width + px] = uint(c0.r) | (uint(c0.g) << 8) | (uint(c0.b) << 16) | 0xff000000u;
+        if (second)
+            rgbaOut[py * pc.width + px + 1] = uint(c1.r) | (uint(c1.g) << 8) | (uint(c1.b) << 16) | 0xff000000u;
+#else
+        imageStore(uOut, ivec2(px, py), vec4(vec3(c0), 255.0) * (1.0 / 255.0));
+        if (second)
+            imageStore(uOut, ivec2(px + 1, py), vec4(vec3(c1), 255.0) * (1.0 / 255.0));
 #endif
     }
 }
@@ -1220,7 +1299,8 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
     if (const char* s = std::getenv("GPU2_WRITE_WG"))
         m_write_wg = std::atoi(s);
     const Push& layout = m_push;
-    const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n";
+    const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n#define LB " + std::to_string(kLb)
+        + "\n#define NCP " + std::to_string(kNcp) + "\n#define PIECE_BITS " + std::to_string(kPieceBits) + "\n";
     mango::vulkan::Compiler compiler;
     // The shared Huffman code sits before each main's local_size declaration,
     // so it reads the workgroup width from HUFF_WG.
@@ -1435,13 +1515,13 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
         return false;
 
     Push push = m_push;
-    push.rounds = m_sync_wg;
+    push.rounds = std::getenv("GPU2_ROUNDS") ? std::atoi(std::getenv("GPU2_ROUNDS")) : m_sync_wg; // EXPERIMENT
 
     VkCommandBuffer cmd = m_cmd;
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .flags = std::getenv("GPU2_PROFILE") ? 0u : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, // PROFILE-HACK
     };
     vkBeginCommandBuffer(cmd, &begin);
     if (m_queries)
@@ -1479,8 +1559,10 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     stamp(VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout, 0, 1, &m_set, 0, nullptr);
+    const char* skip = std::getenv("GPU2_SKIP"); // EXPERIMENT
     auto dispatch = [&](Pipe pipe, std::uint32_t groups)
     {
+        if (skip && std::atoi(skip) == int(pipe)) return; // EXPERIMENT
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipes[pipe]);
         vkCmdPushConstants(cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, std::max(groups, 1u), 1, 1);
@@ -1488,7 +1570,8 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
 
     const std::uint32_t sync_wg = std::uint32_t(m_sync_wg);
     const std::uint32_t sync_groups = (std::uint32_t(chunks) + sync_wg - 1u) / sync_wg;
-    for (int pass = 0; pass < kMaxPasses; ++pass)
+    const int npass = std::getenv("GPU2_PASSES") ? std::atoi(std::getenv("GPU2_PASSES")) : kMaxPasses; // EXPERIMENT
+    for (int pass = 0; pass < npass; ++pass)
     {
         push.pass = pass;
         dispatch(PipeSync, sync_groups);
@@ -1610,6 +1693,27 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
             decode_us = huffman_us + pixel_us;
             publish_us = us(6, 7);
         }
+    }
+    // PROFILE-HACK
+    if (const char* s = std::getenv("GPU2_PROFILE"); s && m_queries)
+    {
+        const int reps = std::atoi(s);
+        double best[7];
+        for (double& b : best) b = 1e30;
+        for (int rep = 0; rep < reps; ++rep)
+        {
+            vkResetFences(m_device, 1, &m_fence);
+            vkQueueSubmit(m_queue, 1, &submit, m_fence);
+            vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, ~0ull);
+            std::uint64_t ts[8] = {};
+            vkGetQueryPoolResults(m_device, m_queries, 0, 8, sizeof(ts), ts, sizeof(std::uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            for (int i = 0; i < 6; ++i)
+                best[i] = std::min(best[i], double(ts[i + 1] - ts[i]) * m_tick_ns / 1000.0);
+            best[6] = std::min(best[6], double(ts[6] - ts[0]) * m_tick_ns / 1000.0);
+        }
+        std::fprintf(stderr, "PROFILE copy %.1f sync %.1f prefix %.1f write %.1f dc %.1f idct %.1f total %.1f us\n",
+            best[0], best[1], best[2], best[3], best[4], best[5], best[6]);
     }
     return true;
 }
