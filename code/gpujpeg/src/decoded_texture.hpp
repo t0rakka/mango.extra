@@ -105,6 +105,10 @@ struct DecodedTexture
     // copies the texels out and back so the sampled image matches the stores.
     void recordPublishComputeStores(VkCommandBuffer cmd);
 
+    // Compute wrote tightly packed RGBA8 into publish_alloc (bound as a storage
+    // buffer). Copies it into the image and leaves the image SHADER_READ_ONLY.
+    void recordPublishFromBuffer(VkCommandBuffer cmd);
+
     // Resting layout after upload/blit helpers: ready to sample / feed compute.
     void recordTransitionToShaderRead(VkCommandBuffer cmd);
 

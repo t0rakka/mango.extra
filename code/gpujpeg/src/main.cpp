@@ -1336,13 +1336,20 @@ public:
                 wall -= job.gpu2->compile_last_us;
             r.ready_us = wall;
             addMilestone(r.milestones, "vk_ready", t0);
-            printLine("  gpu2: decode {:.2f} ms, {} chunks x {} B{}",
-                job.gpu2->decode_us / 1000.0,
+            printLine("  gpu2: huffman {:.2f} ms, pixels {:.2f} ms, submit wall {:.2f} ms, {} chunks x {} bits{}",
+                job.gpu2->huffman_us / 1000.0,
+                job.gpu2->pixel_us / 1000.0,
+                job.gpu2->wall_us / 1000.0,
                 job.gpu2->chunks,
-                256,
+                2048,
                 job.gpu2->compile_last_us
                     ? fmt::format("  (shader compile {:.2f} ms)", job.gpu2->compile_last_us / 1000.0)
                     : "");
+            printLine("        copy {:.2f}  sync {:.2f}  prefix {:.2f}  write {:.2f}  dc {:.2f}  idct {:.2f}  publish {:.2f} ms",
+                job.gpu2->stage_us[0] / 1000.0, job.gpu2->stage_us[1] / 1000.0,
+                job.gpu2->stage_us[2] / 1000.0, job.gpu2->stage_us[3] / 1000.0,
+                job.gpu2->stage_us[4] / 1000.0, job.gpu2->stage_us[5] / 1000.0,
+                job.gpu2->publish_us / 1000.0);
 
             if (std::getenv("GPUJPEG_CHECK"))
             {

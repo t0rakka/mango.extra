@@ -5,6 +5,7 @@
 #include "bench.hpp"
 
 #include <cstdint>
+#include <vector>
 
 #include <mango/image/jpeg.hpp>
 #include <mango/vulkan/vulkan.hpp>
@@ -14,9 +15,10 @@ namespace gpujpeg
 
 struct DecodedTexture;
 
-// Wide self-synchronising Huffman on Vulkan compute, then the same IDCT path
-// as mango-gpu. Chunks are 256 bytes and do not cross a restart segment, so a
-// serial scan and a restart scan dispatch the same way.
+// Wide self-synchronising Huffman on Vulkan compute, then IDCT + YCbCr into
+// the VkImage. The host unstuffs the scan into big-endian words; chunks are
+// 2048 bits and never cross a restart segment, so serial and restart scans
+// dispatch the same way.
 class MangoGpu2Decoder
 {
 public:
@@ -25,7 +27,13 @@ public:
     mango::u64 upload_us = 0;
     mango::u64 compile_us = 0;
     mango::u64 compile_last_us = 0;
-    mango::u64 decode_us = 0;
+    mango::u64 decode_us = 0;   // GPU time (timestamps) when available, else submit wall time
+    mango::u64 huffman_us = 0;  // bit copy + sync + prefix + write + DC scan
+    mango::u64 pixel_us = 0;    // IDCT + colour into the VkImage
+    mango::u64 wall_us = 0;     // submit + fence wait
+    mango::u64 publish_us = 0;  // DecodedTexture publish copy after the IDCT
+    // copy+clear, sync passes, prefix, write, DC scan, IDCT
+    mango::u64 stage_us[6] {};
     int chunks = 0;
     bool uploaded = false;
 
@@ -41,46 +49,60 @@ public:
     MangoGpu2Decoder& operator=(const MangoGpu2Decoder&) = delete;
 
 private:
+    bool createPipelines(mango::vulkan::VulkanWindow& window, DecodedTexture& texture, std::string& error);
+
     mango::ConstMemory m_jpeg;
     bool m_pipeline = false;
-    VkDeviceSize m_bit_bytes = 0;
+    bool m_static_copied = false;
+    bool m_linear = false;  // IDCT writes the texture's publish buffer, then one copy into the image
+    int m_nblk = 0;
+    int m_nsegs = 0;
+    std::uint32_t m_nwords = 0;
+    std::uint32_t m_dc_pack = 0;
+    std::uint32_t m_ac_pack = 0;
+    std::uint32_t m_comp_pack = 0;
+    std::uint32_t m_seg_start_words = 0;
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
     VkCommandPool m_pool = VK_NULL_HANDLE;
     VkCommandBuffer m_cmd = VK_NULL_HANDLE;
     VkFence m_fence = VK_NULL_HANDLE;
+    VkQueryPool m_queries = VK_NULL_HANDLE;
+    float m_tick_ns = 0.0f;
 
-    VkShaderModule m_sync_shader = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_sync_layout = VK_NULL_HANDLE;
-    VkPipelineLayout m_sync_pipe_layout = VK_NULL_HANDLE;
-    VkPipeline m_sync_pipe = VK_NULL_HANDLE;
-    VkDescriptorPool m_sync_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_sync_set = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_layout = VK_NULL_HANDLE;
+    VkPipelineLayout m_pipe_layout = VK_NULL_HANDLE;
+    VkDescriptorPool m_desc_pool = VK_NULL_HANDLE;
+    VkDescriptorSet m_set = VK_NULL_HANDLE;
+    VkShaderModule m_shaders[6] {};
+    VkPipeline m_pipes[6] {};
 
-    VkShaderModule m_prefix_shader = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_prefix_layout = VK_NULL_HANDLE;
-    VkPipelineLayout m_prefix_pipe_layout = VK_NULL_HANDLE;
-    VkPipeline m_prefix_pipe = VK_NULL_HANDLE;
-    VkDescriptorPool m_prefix_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_prefix_set = VK_NULL_HANDLE;
-
-    VkShaderModule m_idct_shader = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_idct_layout = VK_NULL_HANDLE;
-    VkPipelineLayout m_idct_pipe_layout = VK_NULL_HANDLE;
-    VkPipeline m_idct_pipe = VK_NULL_HANDLE;
-    VkDescriptorPool m_idct_pool = VK_NULL_HANDLE;
-    VkDescriptorSet m_idct_set = VK_NULL_HANDLE;
-
+    // host staging
     mango::vulkan::BufferAllocation m_bits;
+    mango::vulkan::BufferAllocation m_chunks_host;
+    mango::vulkan::BufferAllocation m_segs_host;
+    mango::vulkan::BufferAllocation m_tables_host;
+    mango::vulkan::BufferAllocation m_qt_host;
+    mango::vulkan::BufferAllocation m_seg_start_host;
+
+    // device
     mango::vulkan::BufferAllocation m_bits_dev;
     mango::vulkan::BufferAllocation m_chunks;
-    mango::vulkan::BufferAllocation m_tables;
-    mango::vulkan::BufferAllocation m_coeffs;
-    mango::vulkan::BufferAllocation m_state;
-    mango::vulkan::BufferAllocation m_entry;
-    mango::vulkan::BufferAllocation m_cps;
     mango::vulkan::BufferAllocation m_segs;
+    mango::vulkan::BufferAllocation m_tables;
     mango::vulkan::BufferAllocation m_qt;
+    mango::vulkan::BufferAllocation m_st_in;
+    mango::vulkan::BufferAllocation m_st_out;
+    mango::vulkan::BufferAllocation m_cnt;
+    mango::vulkan::BufferAllocation m_cps;
+    mango::vulkan::BufferAllocation m_cpc;
+    mango::vulkan::BufferAllocation m_first;
+    mango::vulkan::BufferAllocation m_coef;
+    mango::vulkan::BufferAllocation m_dcd;
+    mango::vulkan::BufferAllocation m_flags;
+    mango::vulkan::BufferAllocation m_seg_start;
+    mango::vulkan::BufferAllocation m_agg;
 };
-}
+
+} // namespace gpujpeg

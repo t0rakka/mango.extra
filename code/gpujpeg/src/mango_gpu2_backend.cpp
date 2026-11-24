@@ -16,812 +16,586 @@ namespace gpujpeg
 namespace
 {
 
-constexpr std::uint32_t kChunkBytes = 256;
-constexpr int kSyncPasses = 4;
+constexpr int kLb = 10;
+constexpr int kLut = 1 << kLb;
+constexpr int kNcp = 7;
+constexpr int kPieces = kNcp + 1;
+constexpr std::uint32_t kChunkBits = 2048;
+constexpr int kMaxPasses = 8;
 constexpr int kSyncRounds = 128;
-constexpr int kStateWords = 16;
 
-struct TableGpu
-{
-    std::int32_t mincode[16];
-    std::int32_t maxcode[16];
-    std::int32_t valptr[16];
-    std::uint32_t lut[256];
-    std::uint32_t vals[256];
-};
+constexpr int kBindings = 17;
+constexpr std::uint32_t kImageBinding = 14;
+constexpr int kDcTile = 1024; // MCUs per DC scan workgroup: 256 threads x 4
 
-struct TablesFlat
-{
-    std::int32_t mincode[128];
-    std::int32_t maxcode[128];
-    std::int32_t valptr[128];
-    std::uint32_t lut[2048];
-    std::uint32_t vals[2048];
-};
+enum Pipe { PipeSync, PipePrefix, PipeWrite, PipeDcLocal, PipeDcGroups, PipeIdct, PipeCount };
 
 struct ChunkGpu
 {
-    std::uint32_t begin;
-    std::uint32_t end;
-    std::uint32_t segBegin;
-    std::uint32_t segEnd;
-    std::uint32_t seg;
-    std::uint32_t baseCoeff;
-    std::uint32_t coeffEnd;
-    std::uint32_t pad;
+    std::uint32_t bit0;
+    std::uint32_t bit1;
+    std::uint32_t seg0;
+    std::uint32_t seg1;
+    std::int32_t block0;
+    std::int32_t block1;
 };
 
-struct SegInfoGpu
+struct SegGpu
 {
-    std::uint32_t chunk0;
-    std::uint32_t nchunks;
-    std::uint32_t baseCoeff;
-    std::uint32_t pad;
-};
-
-struct SyncPush
-{
+    std::int32_t chunk0;
     std::int32_t nchunks;
+    std::int32_t block0;
+    std::int32_t mcu0;
+    std::int32_t mcus;
+};
+
+// 16-bit LUT entries two per word, Huffman values four per word: the whole
+// thing fits in shared memory next to the sync state.
+struct TablesGpu
+{
+    std::uint32_t lut[8 * kLut / 2];
+    std::int32_t maxc[8 * 18];
+    std::int32_t voff[8 * 18];
+    std::uint32_t hv[8 * 256 / 4];
+};
+
+struct Push
+{
+    std::int32_t nch;
     std::int32_t pass;
     std::int32_t rounds;
-    std::int32_t blocks;
-    std::int32_t doWrite;
-    std::uint32_t pack[10];
-};
-static_assert(offsetof(SyncPush, pack) == 20, "sync push layout");
-
-struct IdctPush
-{
-    std::int32_t width;
-    std::int32_t height;
-    std::int32_t xmcu;
-    std::int32_t mcu_y0;
-    std::int32_t mcu_rows;
-    std::int32_t xblock;
-    std::int32_t yblock;
-    std::int32_t blocks_in_mcu;
-    std::int32_t components;
+    std::int32_t bpm;
+    std::uint32_t dc_pack;
+    std::uint32_t ac_pack;
+    std::uint32_t comp_pack;
+    std::uint32_t nwords;
+    std::int32_t width, height, xmcu, xblock, yblock, components;
     std::int32_t y_hsf, y_vsf, y_qt, y_off;
     std::int32_t cb_hsf, cb_vsf, cb_qt, cb_off;
     std::int32_t cr_hsf, cr_vsf, cr_qt, cr_off;
     std::int32_t mcus_per_group;
+    std::int32_t nmcu;
 };
+static_assert(sizeof(Push) <= 128, "push constants");
 
-constexpr char kSyncSource[] = R"glsl(
+constexpr char kCommon[] = R"glsl(
 #version 450
-layout(local_size_x = 128) in;
-
-layout(std430, set = 0, binding = 0) readonly buffer Bits { uint bits[]; };
-struct Chunk {
-    uint begin;
-    uint end;
-    uint segBegin;
-    uint segEnd;
-    uint seg;
-    uint baseCoeff;
-    uint coeffEnd;
-    uint pad;
-};
-layout(std430, set = 0, binding = 1) readonly buffer Chunks { Chunk chunks[]; };
-layout(std430, set = 0, binding = 2) readonly buffer Tables {
-    int mincode[128];
-    int maxcode[128];
-    int valptr[128];
-    uint lut[2048];
-    uint vals[2048];
-} tb;
-layout(std430, set = 0, binding = 3) writeonly buffer Coeffs { int coeffs[]; };
-layout(std430, set = 0, binding = 4) buffer State { uint st[]; };
-struct Entry {
-    uint coeff;
-    int p0;
-    int p1;
-    int p2;
-    int p3;
-};
-layout(std430, set = 0, binding = 5) readonly buffer Entries { Entry entries[]; };
-struct Cp {
-    uint pos;
-    uint nbits;
-    uint buf;
-    uint z;
-    uint bi;
-    uint n;
-    int d0;
-    int d1;
-    int d2;
-    int d3;
-};
-layout(std430, set = 0, binding = 6) buffer Cps { Cp cps[]; };
+layout(std430, binding = 0) readonly buffer Words { uint words[]; };
+struct Chunk { uint bit0; uint bit1; uint seg0; uint seg1; int block0; int block1; };
+layout(std430, binding = 1) readonly buffer Chunks { Chunk chunks[]; };
+struct Seg { int chunk0; int nchunks; int block0; int mcu0; int mcus; };
+layout(std430, binding = 2) readonly buffer Segs { Seg segs[]; };
+layout(std430, binding = 3) readonly buffer Tables { uint tlut[4096]; int tmaxc[144]; int tvoff[144]; uint thv[512]; };
+layout(std430, binding = 4) buffer StIn { uvec2 stIn[]; };
+layout(std430, binding = 5) buffer StOut { uvec2 stOut[]; };
+layout(std430, binding = 6) buffer Cnt { int cnt[]; };
+layout(std430, binding = 7) buffer Cps { uvec2 cps[]; };
+layout(std430, binding = 8) buffer Cpc { int cpc[]; };
+layout(std430, binding = 9) buffer First { int firstb[]; };
+layout(std430, binding = 10) buffer Coef { uint coef[]; };
+layout(std430, binding = 11) buffer Dcd { int dcd[]; };
+layout(std430, binding = 12) readonly buffer Qt { int qt[256]; };
+layout(std430, binding = 13) buffer Flags { uint flags[]; };
+layout(std430, binding = 15) readonly buffer SegStart { uint segStart[]; };
+layout(std430, binding = 16) buffer Agg { ivec4 agg[]; };
 
 layout(push_constant) uniform Push {
-    int nchunks;
+    int nch;
     int pass;
     int rounds;
-    int blocks;
-    int doWrite;
-    uint pack[10];
-} pc;
-
-struct St {
-    uint epos, enbits, ebuf, ez, ebi;
-    uint pos, nbits, buf, z, bi, n;
-    int d0, d1, d2, d3;
-};
-
-struct Reader {
-    uint pos;
-    uint endp;
-    uint buf;
-    uint nbits;
-};
-
-uint loadByte(uint i)
-{
-    uint w = bits[i >> 2];
-    return (w >> ((i & 3u) * 8u)) & 0xffu;
-}
-
-uint pullByte(inout Reader r)
-{
-    if (r.pos >= r.endp)
-        return 0u;
-    uint b = loadByte(r.pos);
-    r.pos++;
-    if (b == 0xffu)
-    {
-        if (r.pos < r.endp && loadByte(r.pos) == 0u)
-            r.pos++;
-        else
-            r.pos = r.endp;
-    }
-    return b;
-}
-
-void fill(inout Reader r, uint need)
-{
-    while (r.nbits < need && r.pos < r.endp)
-    {
-        r.buf = (r.buf << 8) | pullByte(r);
-        r.nbits += 8u;
-    }
-}
-
-uint getBits(inout Reader r, uint n)
-{
-    if (n >= 32u)
-        return 0u;
-    fill(r, n);
-    if (r.nbits < n)
-        return 0u;
-    r.nbits -= n;
-    return (r.buf >> r.nbits) & ((1u << n) - 1u);
-}
-
-int extendSign(int v, int n)
-{
-    if (n <= 0 || n >= 31)
-        return v;
-    int vt = 1 << (n - 1);
-    if (v < vt)
-        v -= (1 << n) - 1;
-    return v;
-}
-
-int decodeSym(inout Reader r, int ti)
-{
-    if (ti < 0 || ti > 7)
-        return 0;
-    fill(r, 8u);
-    if (r.nbits >= 8u)
-    {
-        uint look = (r.buf >> (r.nbits - 8u)) & 0xffu;
-        uint packed = tb.lut[ti * 256 + int(look)];
-        uint len = packed & 0xffu;
-        if (len > 0u && len <= 8u)
-        {
-            r.nbits -= len;
-            return int(packed >> 8);
-        }
-    }
-    int base = ti * 16;
-    int code = 0;
-    for (int L = 0; L < 16; ++L)
-    {
-        if (r.nbits == 0u)
-            fill(r, 8u);
-        if (r.nbits == 0u)
-            return 0;
-        r.nbits -= 1u;
-        code = (code << 1) | int((r.buf >> r.nbits) & 1u);
-        int mx = tb.maxcode[base + L];
-        if (mx >= 0 && code <= mx)
-        {
-            int idx = tb.valptr[base + L] + code - tb.mincode[base + L];
-            if (idx < 0 || idx > 255)
-                return 0;
-            return int(tb.vals[ti * 256 + idx]);
-        }
-    }
-    return 0;
-}
-
-bool stateEq(uint pos, uint nbits, uint buf, uint z, uint bi,
-             uint pos2, uint nbits2, uint buf2, uint z2, uint bi2)
-{
-    if (pos != pos2 || nbits != nbits2 || z != z2 || bi != bi2)
-        return false;
-    if (nbits == 0u)
-        return true;
-    if (nbits >= 32u)
-        return false;
-    uint mask = (1u << nbits) - 1u;
-    return (buf & mask) == (buf2 & mask);
-}
-
-void storeCp(uint idx, uint pos, uint nbits, uint buf, uint z, uint bi,
-             uint n, int d0, int d1, int d2, int d3)
-{
-    Cp o;
-    o.pos = pos;
-    o.nbits = nbits;
-    o.buf = buf;
-    o.z = z;
-    o.bi = bi;
-    o.n = n;
-    o.d0 = d0;
-    o.d1 = d1;
-    o.d2 = d2;
-    o.d3 = d3;
-    cps[idx] = o;
-}
-
-// mode 0: decode. mode 1: also record checkpoints. mode 2: confirm, stop at the
-// first checkpoint whose cursor matches and keep that walk's tail.
-St walk(St start, Chunk c, bool doWrite, int p0, int p1, int p2, int p3, uint dst, uint endIdx,
-        St spec, int mode, uint chunkId, uint useStop,
-        uint stopPos, uint stopNbits, uint stopBuf, uint stopZ, uint stopBi)
-{
-    Reader r;
-    r.pos = start.pos;
-    r.endp = c.segEnd;
-    r.buf = start.buf;
-    r.nbits = start.nbits;
-
-    St s;
-    s.epos = start.pos;
-    s.enbits = start.nbits;
-    s.ebuf = start.buf;
-    s.ez = start.z;
-    s.ebi = start.bi;
-    s.pos = start.pos;
-    s.nbits = start.nbits;
-    s.buf = start.buf;
-    s.z = start.z;
-    s.bi = start.bi;
-    s.n = 0u;
-    s.d0 = 0;
-    s.d1 = 0;
-    s.d2 = 0;
-    s.d3 = 0;
-
-    int pred0 = p0;
-    int pred1 = p1;
-    int pred2 = p2;
-    int pred3 = p3;
-    uint limit = c.end * 8u;
-    uint cur0 = r.pos * 8u - r.nbits;
-    int budget = 64;
-    if (limit > cur0)
-        budget = int(limit - cur0) + 64;
-    uint nextK = 0u;
-
-    for (int guard = 0; guard < budget; ++guard)
-    {
-        if (r.nbits > r.pos * 8u)
-            break;
-        uint cur = r.pos * 8u - r.nbits;
-        if (cur >= limit)
-            break;
-        if (r.nbits == 0u && r.pos >= r.endp)
-            break;
-        if (useStop != 0u && stateEq(r.pos, r.nbits, r.buf, s.z, s.bi,
-                stopPos, stopNbits, stopBuf, stopZ, stopBi))
-            break;
-
-        if (mode != 0)
-        {
-            while (nextK < 3u)
-            {
-                uint boundary = c.begin + (nextK + 1u) * 64u;
-                if (boundary >= c.end || cur < boundary * 8u)
-                    break;
-                uint idx = chunkId * 4u + nextK;
-                if (mode == 2)
-                {
-                    Cp saved = cps[idx];
-                    if (saved.pos != 0xffffffffu && stateEq(r.pos, r.nbits, r.buf, s.z, s.bi,
-                            saved.pos, saved.nbits, saved.buf, saved.z, saved.bi))
-                    {
-                        int dn = int(s.n) - int(saved.n);
-                        int dd0 = s.d0 - saved.d0;
-                        int dd1 = s.d1 - saved.d1;
-                        int dd2 = s.d2 - saved.d2;
-                        int dd3 = s.d3 - saved.d3;
-                        for (uint j = nextK; j < 3u; ++j)
-                        {
-                            uint jdx = chunkId * 4u + j;
-                            Cp tail = cps[jdx];
-                            if (tail.pos == 0xffffffffu)
-                                continue;
-                            tail.n = uint(int(tail.n) + dn);
-                            tail.d0 += dd0;
-                            tail.d1 += dd1;
-                            tail.d2 += dd2;
-                            tail.d3 += dd3;
-                            cps[jdx] = tail;
-                        }
-                        s.n = uint(int(spec.n) + dn);
-                        s.d0 = spec.d0 + dd0;
-                        s.d1 = spec.d1 + dd1;
-                        s.d2 = spec.d2 + dd2;
-                        s.d3 = spec.d3 + dd3;
-                        s.pos = spec.pos;
-                        s.nbits = spec.nbits;
-                        s.buf = spec.buf;
-                        s.z = spec.z;
-                        s.bi = spec.bi;
-                        return s;
-                    }
-                }
-                storeCp(idx, r.pos, r.nbits, r.buf, s.z, s.bi, s.n, s.d0, s.d1, s.d2, s.d3);
-                nextK += 1u;
-            }
-        }
-
-        uint bi = s.bi;
-        if (bi >= uint(pc.blocks))
-            bi = 0u;
-        uint pack = pc.pack[bi];
-        bool isDc = (s.z == 0u);
-        int ti = isDc ? int(pack & 0xffu) : int((pack >> 8) & 0xffu);
-        int pi = int((pack >> 16) & 0xffu);
-        int symbol = decodeSym(r, ti);
-
-        if (isDc)
-        {
-            int diff = 0;
-            if (symbol != 0)
-                diff = extendSign(int(getBits(r, uint(symbol))), symbol);
-            int shown = diff;
-            if (doWrite)
-            {
-                if (pi == 0) { shown = diff + pred0; pred0 = shown; }
-                else if (pi == 1) { shown = diff + pred1; pred1 = shown; }
-                else if (pi == 2) { shown = diff + pred2; pred2 = shown; }
-                else { shown = diff + pred3; pred3 = shown; }
-                if (dst + s.n < endIdx)
-                    coeffs[dst + s.n] = shown;
-            }
-            if (pi == 0) s.d0 += diff;
-            else if (pi == 1) s.d1 += diff;
-            else if (pi == 2) s.d2 += diff;
-            else s.d3 += diff;
-            s.n += 1u;
-            s.z = 1u;
-        }
-        else if (symbol == 0)
-        {
-            uint left = 64u - s.z;
-            if (doWrite)
-            {
-                for (uint k = 0u; k < left; ++k)
-                {
-                    if (dst + s.n + k < endIdx)
-                        coeffs[dst + s.n + k] = 0;
-                }
-            }
-            s.n += left;
-            s.z = 0u;
-            s.bi += 1u;
-            if (s.bi >= uint(pc.blocks))
-                s.bi = 0u;
-        }
-        else
-        {
-            int run = symbol >> 4;
-            int nb = symbol & 15;
-            if (nb == 0)
-            {
-                uint zeros = 16u;
-                bool endBlock = (s.z + zeros >= 64u);
-                if (endBlock)
-                    zeros = 64u - s.z;
-                if (doWrite)
-                {
-                    for (uint k = 0u; k < zeros; ++k)
-                    {
-                        if (dst + s.n + k < endIdx)
-                            coeffs[dst + s.n + k] = 0;
-                    }
-                }
-                s.n += zeros;
-                if (endBlock)
-                {
-                    s.z = 0u;
-                    s.bi += 1u;
-                    if (s.bi >= uint(pc.blocks))
-                        s.bi = 0u;
-                }
-                else
-                    s.z += zeros;
-            }
-            else
-            {
-                int mag = extendSign(int(getBits(r, uint(nb))), nb);
-                uint room = 64u - s.z;
-                uint zeros = uint(run);
-                bool hasValue = true;
-                if (zeros >= room)
-                {
-                    zeros = room;
-                    hasValue = false;
-                }
-                if (doWrite)
-                {
-                    for (uint k = 0u; k < zeros; ++k)
-                    {
-                        if (dst + s.n + k < endIdx)
-                            coeffs[dst + s.n + k] = 0;
-                    }
-                }
-                s.n += zeros;
-                s.z += zeros;
-                if (hasValue && s.z < 64u)
-                {
-                    if (doWrite && dst + s.n < endIdx)
-                        coeffs[dst + s.n] = mag;
-                    s.n += 1u;
-                    s.z += 1u;
-                }
-                if (s.z >= 64u)
-                {
-                    s.z = 0u;
-                    s.bi += 1u;
-                    if (s.bi >= uint(pc.blocks))
-                        s.bi = 0u;
-                }
-            }
-        }
-    }
-    s.pos = r.pos;
-    s.nbits = r.nbits;
-    s.buf = r.buf;
-    return s;
-}
-
-bool cursorEq(St a, St b)
-{
-    if (a.epos != b.pos || a.enbits != b.nbits || a.ez != b.z || a.ebi != b.bi)
-        return false;
-    if (a.enbits == 0u)
-        return true;
-    if (a.enbits >= 32u)
-        return false;
-    uint mask = (1u << a.enbits) - 1u;
-    return (a.ebuf & mask) == (b.buf & mask);
-}
-
-St loadSt(uint i)
-{
-    uint o = i * 16u;
-    St s;
-    s.epos = st[o + 0u];
-    s.enbits = st[o + 1u];
-    s.ebuf = st[o + 2u];
-    s.ez = st[o + 3u];
-    s.ebi = st[o + 4u];
-    s.pos = st[o + 5u];
-    s.nbits = st[o + 6u];
-    s.buf = st[o + 7u];
-    s.z = st[o + 8u];
-    s.bi = st[o + 9u];
-    s.n = st[o + 10u];
-    s.d0 = int(st[o + 11u]);
-    s.d1 = int(st[o + 12u]);
-    s.d2 = int(st[o + 13u]);
-    s.d3 = int(st[o + 14u]);
-    return s;
-}
-
-void storeSt(uint i, St s)
-{
-    uint o = i * 16u;
-    st[o + 0u] = s.epos;
-    st[o + 1u] = s.enbits;
-    st[o + 2u] = s.ebuf;
-    st[o + 3u] = s.ez;
-    st[o + 4u] = s.ebi;
-    st[o + 5u] = s.pos;
-    st[o + 6u] = s.nbits;
-    st[o + 7u] = s.buf;
-    st[o + 8u] = s.z;
-    st[o + 9u] = s.bi;
-    st[o + 10u] = s.n;
-    st[o + 11u] = uint(s.d0);
-    st[o + 12u] = uint(s.d1);
-    st[o + 13u] = uint(s.d2);
-    st[o + 14u] = uint(s.d3);
-}
-
-St guessOf(Chunk c)
-{
-    St s;
-    s.pos = c.begin;
-    s.nbits = 0u;
-    s.buf = 0u;
-    s.z = 0u;
-    s.bi = 0u;
-    s.epos = 0u;
-    s.enbits = 0u;
-    s.ebuf = 0u;
-    s.ez = 0u;
-    s.ebi = 0u;
-    s.n = 0u;
-    s.d0 = 0;
-    s.d1 = 0;
-    s.d2 = 0;
-    s.d3 = 0;
-    return s;
-}
-
-St exitAsStart(St prev)
-{
-    St s = prev;
-    s.pos = prev.pos;
-    s.nbits = prev.nbits;
-    s.buf = prev.buf;
-    s.z = prev.z;
-    s.bi = prev.bi;
-    return s;
-}
-
-shared St sh[128];
-shared uint flag;
-
-void main()
-{
-    uint i = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-    bool live = i < uint(pc.nchunks);
-
-    if (pc.doWrite != 0)
-    {
-        if (!live)
-            return;
-        Chunk c = chunks[i];
-        St start = guessOf(c);
-        if (c.begin != c.segBegin && i > 0u)
-            start = exitAsStart(loadSt(i - 1u));
-        Entry e = entries[i];
-        St none = guessOf(c);
-        walk(start, c, true, e.p0, e.p1, e.p2, e.p3, e.coeff, c.coeffEnd,
-            none, 0, i, 0u, 0u, 0u, 0u, 0u, 0u);
-        return;
-    }
-
-    St mine;
-    St none = guessOf(chunks[0]);
-    if (live && pc.pass == 0)
-        mine = walk(guessOf(chunks[i]), chunks[i], false, 0, 0, 0, 0, 0u, 0u,
-            none, 1, i, 0u, 0u, 0u, 0u, 0u, 0u);
-    else if (live)
-        mine = loadSt(i);
-
-    if (lid == 0u)
-        flag = 0u;
-    barrier();
-    sh[lid] = mine;
-    barrier();
-
-    St globPrev;
-    bool haveGlob = false;
-    if (live && lid == 0u && pc.pass > 0 && i > 0u && chunks[i].seg == chunks[i - 1u].seg)
-    {
-        globPrev = loadSt(i - 1u);
-        haveGlob = true;
-    }
-
-    for (int round = 0; round < pc.rounds; ++round)
-    {
-        bool ch = false;
-        if (live && chunks[i].begin != chunks[i].segBegin)
-        {
-            St prev;
-            bool have = false;
-            if (lid == 0u)
-            {
-                if (haveGlob)
-                {
-                    prev = globPrev;
-                    have = true;
-                }
-            }
-            else if (chunks[i].seg == chunks[i - 1u].seg)
-            {
-                prev = sh[lid - 1u];
-                have = true;
-            }
-            if (have && !cursorEq(mine, prev))
-            {
-                St before = mine;
-                mine = walk(exitAsStart(prev), chunks[i], false, 0, 0, 0, 0, 0u, 0u,
-                    before, 2, i, 0u, 0u, 0u, 0u, 0u, 0u);
-                ch = !stateEq(mine.pos, mine.nbits, mine.buf, mine.z, mine.bi,
-                    before.pos, before.nbits, before.buf, before.z, before.bi);
-            }
-        }
-        barrier();
-        if (live)
-            sh[lid] = mine;
-        if (ch)
-            atomicOr(flag, 1u);
-        barrier();
-        if (flag == 0u)
-            break;
-        barrier();
-        if (lid == 0u)
-            flag = 0u;
-        barrier();
-    }
-    if (live)
-        storeSt(i, mine);
-}
-)glsl";
-
-constexpr char kPrefixSource[] = R"glsl(
-#version 450
-layout(local_size_x = 256) in;
-
-struct SegInfo {
-    uint chunk0;
-    uint nchunks;
-    uint baseCoeff;
-    uint pad;
-};
-layout(std430, set = 0, binding = 0) readonly buffer Segs { SegInfo segs[]; };
-layout(std430, set = 0, binding = 1) readonly buffer State { uint st[]; };
-struct Entry {
-    uint coeff;
-    int p0;
-    int p1;
-    int p2;
-    int p3;
-};
-layout(std430, set = 0, binding = 2) writeonly buffer Entries { Entry entries[]; };
-
-shared uint sn[256];
-shared int sd0[256];
-shared int sd1[256];
-shared int sd2[256];
-shared int sd3[256];
-shared uint run_n;
-shared int run0, run1, run2, run3;
-
-void main()
-{
-    uint li = gl_LocalInvocationID.x;
-    SegInfo seg = segs[gl_WorkGroupID.x];
-    if (li == 0u)
-    {
-        run_n = 0u;
-        run0 = 0;
-        run1 = 0;
-        run2 = 0;
-        run3 = 0;
-    }
-    barrier();
-
-    for (uint tile = 0u; tile < seg.nchunks; tile += 256u)
-    {
-        uint ci = tile + li;
-        bool on = ci < seg.nchunks;
-        uint n = 0u;
-        int d0 = 0;
-        int d1 = 0;
-        int d2 = 0;
-        int d3 = 0;
-        if (on)
-        {
-            uint o = (seg.chunk0 + ci) * 16u;
-            n = st[o + 10u];
-            d0 = int(st[o + 11u]);
-            d1 = int(st[o + 12u]);
-            d2 = int(st[o + 13u]);
-            d3 = int(st[o + 14u]);
-        }
-        uint self_n = n;
-        int self0 = d0, self1 = d1, self2 = d2, self3 = d3;
-        sn[li] = n;
-        sd0[li] = d0;
-        sd1[li] = d1;
-        sd2[li] = d2;
-        sd3[li] = d3;
-        barrier();
-
-        for (uint off = 1u; off < 256u; off <<= 1u)
-        {
-            uint nn = sn[li];
-            int a0 = sd0[li];
-            int a1 = sd1[li];
-            int a2 = sd2[li];
-            int a3 = sd3[li];
-            barrier();
-            if (li >= off)
-            {
-                nn += sn[li - off];
-                a0 += sd0[li - off];
-                a1 += sd1[li - off];
-                a2 += sd2[li - off];
-                a3 += sd3[li - off];
-            }
-            barrier();
-            sn[li] = nn;
-            sd0[li] = a0;
-            sd1[li] = a1;
-            sd2[li] = a2;
-            sd3[li] = a3;
-            barrier();
-        }
-
-        if (on)
-        {
-            Entry e;
-            e.coeff = seg.baseCoeff + run_n + (sn[li] - self_n);
-            e.p0 = run0 + (sd0[li] - self0);
-            e.p1 = run1 + (sd1[li] - self1);
-            e.p2 = run2 + (sd2[li] - self2);
-            e.p3 = run3 + (sd3[li] - self3);
-            entries[seg.chunk0 + ci] = e;
-        }
-        barrier();
-        if (li == 0u)
-        {
-            uint last = min(255u, seg.nchunks - tile - 1u);
-            run_n += sn[last];
-            run0 += sd0[last];
-            run1 += sd1[last];
-            run2 += sd2[last];
-            run3 += sd3[last];
-        }
-        barrier();
-    }
-}
-)glsl";
-
-constexpr char kIdctSource[] = R"glsl(
-#version 450
-layout(local_size_x = 256) in;
-
-layout(binding = 0, rgba8) uniform writeonly image2D uOut;
-layout(binding = 1) readonly buffer Coeffs { int c[]; };
-layout(binding = 2) readonly buffer Qt { int qt[4 * 64]; };
-
-layout(push_constant) uniform PC {
-    int width;
-    int height;
-    int xmcu;
-    int mcu_y0;
-    int mcu_rows;
-    int xblock;
-    int yblock;
-    int blocks_in_mcu;
-    int components;
+    int bpm;
+    uint dcPack;
+    uint acPack;
+    uint compPack;
+    uint nwords;
+    int width, height, xmcu, xblock, yblock, components;
     int y_hsf, y_vsf, y_qt, y_off;
     int cb_hsf, cb_vsf, cb_qt, cb_off;
     int cr_hsf, cr_vsf, cr_qt, cr_off;
-    int mcus_per_group;
+    int mcusPerGroup;
+    int nmcu;
 } pc;
+)glsl";
+
+constexpr char kHuffman[] = R"glsl(
+shared uint slut[4096];
+shared int smaxc[144];
+shared int svoff[144];
+shared uint shv[512];
+
+void loadTabs()
+{
+    uint t = gl_LocalInvocationIndex;
+    uint n = gl_WorkGroupSize.x;
+    for (uint i = t; i < 4096u; i += n)
+        slut[i] = tlut[i];
+    for (uint i = t; i < 144u; i += n)
+    {
+        smaxc[i] = tmaxc[i];
+        svoff[i] = tvoff[i];
+    }
+    for (uint i = t; i < 512u; i += n)
+        shv[i] = thv[i];
+    barrier();
+}
+
+struct Rd { uint wi; uint a; uint b; };
+
+uint wordAt(uint i)
+{
+    return i < pc.nwords ? words[i] : 0u;
+}
+
+void seek(inout Rd r, uint pos)
+{
+    r.wi = pos >> 5;
+    r.a = wordAt(r.wi);
+    r.b = wordAt(r.wi + 1u);
+}
+
+uint peek(inout Rd r, uint pos)
+{
+    uint at = pos >> 5;
+    while (r.wi != at)
+    {
+        r.a = r.b;
+        r.wi++;
+        r.b = wordAt(r.wi + 1u);
+    }
+    uint n = pos & 31u;
+    return n == 0u ? r.a : ((r.a << n) | (r.b >> (32u - n)));
+}
+
+int symEntry(int sym, int len, bool dc)
+{
+    int s = sym & 15;
+    int r = sym >> 4;
+    int za = dc ? 1 : (s != 0 ? r + 1 : (r == 15 ? 16 : 64));
+    return (len + s) | (s << 5) | (za << 9);
+}
+
+int hent(int ti, uint bits, bool dc)
+{
+    int idx = (ti << 10) | int(bits >> 22);
+    uint w = slut[idx >> 1];
+    int e = int((idx & 1) != 0 ? (w >> 16) : (w & 0xffffu));
+    if (e != 0)
+        return e;
+    int l = 11;
+    int code = int(bits >> 21);
+    while (l <= 16 && code > smaxc[ti * 18 + l])
+    {
+        ++l;
+        code = int(bits >> uint(32 - l));
+    }
+    if (l > 16)
+        return 16 | ((dc ? 1 : 64) << 9);
+    int k = ti * 256 + code + svoff[ti * 18 + l];
+    int sym = int((shv[k >> 2] >> (uint(k & 3) * 8u)) & 0xffu);
+    return symEntry(sym, l, dc);
+}
+
+int tableOf(int c, bool dc)
+{
+    return int(((dc ? pc.dcPack : pc.acPack) >> (3u * uint(c))) & 7u);
+}
+
+void stepSkip(inout Rd r, inout uint pos, int c, inout int z)
+{
+    uint bits = peek(r, pos);
+    bool dc = z == 0;
+    int h = hent(tableOf(c, dc), bits, dc);
+    pos += uint(h & 31);
+    z += (h >> 9) & 127;
+}
+
+int nextBlock(int c)
+{
+    return c + 1 == pc.bpm ? 0 : c + 1;
+}
+
+uvec2 pack(uint pos, int c, int z)
+{
+    return uvec2(pos, uint((c << 8) | z));
+}
+)glsl";
+
+constexpr char kSyncMain[] = R"glsl(
+layout(local_size_x = 128) in;
+
+shared uvec2 so[128];
+shared uint anyCh;
+
+// Walk from (pos, c, z) to end, recording the state at the first symbol
+// boundary past each 256-bit mark. With cmp, stop at the first mark whose
+// state matches this chunk's previous walk and shift the later block counts.
+bool runChunk(inout Rd r, inout uint pos, inout int c, inout int z, uint base, uint end,
+              uint cpBase, inout int n, bool cmp)
+{
+    int done = 0;
+    for (int j = 0; j <= 7; ++j)
+    {
+        uint mark = j < 7 ? min(base + uint((j + 1) * 256), end) : end;
+        while (pos < mark)
+        {
+            stepSkip(r, pos, c, z);
+            if (z >= 64)
+            {
+                z = 0;
+                c = nextBlock(c);
+                ++done;
+            }
+        }
+        if (j == 7)
+            break;
+        uvec2 st = pack(pos, c, z);
+        uint at = cpBase + uint(j);
+        if (cmp && st == cps[at])
+        {
+            int shift = done - cpc[at];
+            for (int k = j; k < 7; ++k)
+                cpc[cpBase + uint(k)] += shift;
+            n += shift;
+            return true;
+        }
+        cps[at] = st;
+        cpc[at] = done;
+    }
+    n = done;
+    return false;
+}
+
+void main()
+{
+    if (pc.pass > 0 && flags[pc.pass - 1] == 0u)
+        return;
+    loadTabs();
+
+    int tid = int(gl_LocalInvocationID.x);
+    int i = int(gl_WorkGroupID.x) * 128 + tid;
+    bool valid = i < pc.nch;
+    bool known = !valid || chunks[i].bit0 == chunks[i].seg0;
+    uint cpBase = uint(max(i, 0)) * 7u;
+
+    Rd r;
+    uvec2 myIn = uvec2(0u);
+    uvec2 myOut = uvec2(0u);
+    int n = 0;
+    if (valid)
+    {
+        if (pc.pass == 0)
+        {
+            uint pos = chunks[i].bit0;
+            int c = 0;
+            int z = 0;
+            myIn = pack(pos, 0, 0);
+            seek(r, pos);
+            runChunk(r, pos, c, z, chunks[i].bit0, chunks[i].bit1, cpBase, n, false);
+            myOut = pack(pos, c, z);
+        }
+        else
+        {
+            myIn = stIn[i];
+            myOut = stOut[i];
+            n = cnt[i];
+        }
+    }
+    uvec2 out0 = myOut;
+    uvec2 globPrev = uvec2(0u);
+    if (pc.pass > 0 && valid && tid == 0 && !known)
+        globPrev = stOut[i - 1];
+    so[tid] = myOut;
+    if (tid == 0)
+        anyCh = 0u;
+    barrier();
+
+    bool more = false;
+    for (int it = 0; it < pc.rounds; ++it)
+    {
+        bool ch = false;
+        if (valid && !known && (tid > 0 || pc.pass > 0))
+        {
+            uvec2 want = tid == 0 ? globPrev : so[tid - 1];
+            if (want != myIn)
+            {
+                myIn = want;
+                uint pos = want.x;
+                int c = int((want.y >> 8) & 255u);
+                int z = int(want.y & 255u);
+                seek(r, pos);
+                bool same = runChunk(r, pos, c, z, chunks[i].bit0, chunks[i].bit1, cpBase, n, true);
+                uvec2 e = same ? myOut : pack(pos, c, z);
+                if (e != myOut)
+                {
+                    myOut = e;
+                    ch = true;
+                }
+            }
+        }
+        barrier();
+        so[tid] = myOut;
+        if (ch)
+            anyCh = 1u;
+        barrier();
+        more = anyCh != 0u;
+        barrier();
+        if (tid == 0)
+            anyCh = 0u;
+        if (!more)
+            break;
+    }
+    if (valid)
+    {
+        stIn[i] = myIn;
+        stOut[i] = myOut;
+        cnt[i] = n;
+    }
+    int last = min(128, pc.nch - int(gl_WorkGroupID.x) * 128) - 1;
+    if (tid == last && (myOut != out0 || more || (pc.pass == 0 && gl_NumWorkGroups.x > 1u)))
+        flags[pc.pass] = 1u;
+}
+)glsl";
+
+constexpr char kPrefixMain[] = R"glsl(
+layout(local_size_x = 256) in;
+
+shared int sh[256];
+shared int run;
+
+void main()
+{
+    Seg s = segs[gl_WorkGroupID.x];
+    uint t = gl_LocalInvocationID.x;
+    if (t == 0u)
+        run = 0;
+    barrier();
+    for (int tile = 0; tile < s.nchunks; tile += 256)
+    {
+        int ci = tile + int(t);
+        int n = ci < s.nchunks ? cnt[s.chunk0 + ci] : 0;
+        sh[t] = n;
+        barrier();
+        for (uint off = 1u; off < 256u; off <<= 1u)
+        {
+            int v = sh[t];
+            if (t >= off)
+                v += sh[t - off];
+            barrier();
+            sh[t] = v;
+            barrier();
+        }
+        if (ci < s.nchunks)
+            firstb[s.chunk0 + ci] = s.block0 + run + sh[t] - n;
+        barrier();
+        if (t == 0u)
+            run += sh[min(255, s.nchunks - tile - 1)];
+        barrier();
+    }
+}
+)glsl";
+
+constexpr char kWriteMain[] = R"glsl(
+layout(local_size_x = 128) in;
+
+// A block belongs to the piece its DC symbol starts in: a piece first skips
+// the rest of a block begun before it, and finishes its own last block past
+// its end. AC values go out two per word as they pass; the buffer is zeroed.
+void main()
+{
+    loadTabs();
+    int gi = int(gl_GlobalInvocationID.x);
+    int i = gi >> 3;
+    int piece = gi & 7;
+    if (i >= pc.nch)
+        return;
+    Chunk ch = chunks[i];
+    uvec2 s = piece == 0 ? stIn[i] : cps[uint(i) * 7u + uint(piece - 1)];
+    uint pos = s.x;
+    int bc = int((s.y >> 8) & 255u);
+    int z = int(s.y & 255u);
+    int B = firstb[i] + (piece == 0 ? 0 : cpc[i * 7 + piece - 1]);
+    uint mark = piece < 7 ? min(ch.bit0 + uint((piece + 1) * 256), ch.bit1) : ch.bit1;
+
+    Rd r;
+    seek(r, pos);
+    if (z != 0)
+    {
+        while (z < 64)
+            stepSkip(r, pos, bc, z);
+        z = 0;
+        bc = nextBlock(bc);
+        ++B;
+    }
+    while (pos < mark && B < ch.block1)
+    {
+        uint base = uint(B) * 32u;
+        int dcv = 0;
+        uint pend = 0u;
+        int pq = -1;
+        do
+        {
+            uint bits = peek(r, pos);
+            bool dc = z == 0;
+            int h = hent(tableOf(bc, dc), bits, dc);
+            int tot = h & 31;
+            int sz = (h >> 5) & 15;
+            int za = (h >> 9) & 127;
+            if (sz != 0)
+            {
+                int v = int((bits << uint(tot - sz)) >> uint(32 - sz));
+                if (v < (1 << (sz - 1)))
+                    v = v - (1 << sz) + 1;
+                int zi = z + za - 1;
+                if (dc)
+                    dcv = v;
+                else if (zi < 64)
+                {
+                    int q = zi >> 1;
+                    if (q != pq)
+                    {
+                        if (pq >= 0)
+                            coef[base + uint(pq)] = pend;
+                        pend = 0u;
+                        pq = q;
+                    }
+                    pend |= (uint(v) & 0xffffu) << (uint(zi & 1) * 16u);
+                }
+            }
+            pos += uint(tot);
+            z += za;
+        } while (z < 64);
+        if (pq >= 0)
+            coef[base + uint(pq)] = pend;
+        dcd[B] = dcv;
+        z = 0;
+        bc = nextBlock(bc);
+        ++B;
+    }
+}
+)glsl";
+
+constexpr char kDcScan[] = R"glsl(
+layout(local_size_x = 256) in;
+
+// Segmented scan element: x = a segment starts inside, yzw = DC sums per
+// component after the last start. a comes before b.
+ivec4 combine(ivec4 a, ivec4 b)
+{
+    return b.x != 0 ? b : ivec4(a.x, a.yzw + b.yzw);
+}
+
+bool isStart(int m)
+{
+    return ((segStart[m >> 5] >> uint(m & 31)) & 1u) != 0u;
+}
+
+int compOf(int k)
+{
+    return int((pc.compPack >> (2u * uint(k))) & 3u);
+}
+
+shared ivec4 sa[256];
+
+ivec4 scan256(ivec4 v, uint t)
+{
+    sa[t] = v;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1u)
+    {
+        ivec4 x = sa[t];
+        if (t >= off)
+            x = combine(sa[t - off], x);
+        barrier();
+        sa[t] = x;
+        barrier();
+    }
+    return sa[t];
+}
+)glsl";
+
+// pass 0: per-tile totals into agg[group]. pass 1: absolute DC values.
+constexpr char kDcLocalMain[] = R"glsl(
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    int g = int(gl_WorkGroupID.x);
+    int m0 = g * 1024 + int(t) * 4;
+    int m1 = min(m0 + 4, pc.nmcu);
+    ivec4 acc = ivec4(0);
+    for (int m = m0; m < m1; ++m)
+    {
+        if (isStart(m))
+            acc = ivec4(1, 0, 0, 0);
+        int p = m * pc.bpm;
+        for (int k = 0; k < pc.bpm; ++k)
+        {
+            int ci = compOf(k);
+            int v = dcd[p + k];
+            if (ci == 0) acc.y += v;
+            else if (ci == 1) acc.z += v;
+            else acc.w += v;
+        }
+    }
+    ivec4 incl = scan256(acc, t);
+    if (pc.pass == 0)
+    {
+        if (t == 255u)
+            agg[g] = incl;
+        return;
+    }
+    ivec4 excl = t == 0u ? ivec4(0) : sa[t - 1u];
+    ivec4 run = combine(agg[int(gl_NumWorkGroups.x) + g], excl);
+    for (int m = m0; m < m1; ++m)
+    {
+        if (isStart(m))
+            run = ivec4(1, 0, 0, 0);
+        int p = m * pc.bpm;
+        for (int k = 0; k < pc.bpm; ++k)
+        {
+            int ci = compOf(k);
+            int v = dcd[p + k];
+            if (ci == 0) { run.y += v; dcd[p + k] = run.y; }
+            else if (ci == 1) { run.z += v; dcd[p + k] = run.z; }
+            else { run.w += v; dcd[p + k] = run.w; }
+        }
+    }
+}
+)glsl";
+
+// One workgroup: exclusive prefix of the tile totals into agg[ngroups + g].
+constexpr char kDcGroupsMain[] = R"glsl(
+shared ivec4 carry;
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    int ngroups = pc.nch;
+    if (t == 0u)
+        carry = ivec4(0);
+    barrier();
+    for (int tile = 0; tile < ngroups; tile += 256)
+    {
+        int g = tile + int(t);
+        ivec4 v = g < ngroups ? agg[g] : ivec4(0);
+        ivec4 incl = scan256(v, t);
+        ivec4 excl = t == 0u ? ivec4(0) : sa[t - 1u];
+        if (g < ngroups)
+            agg[ngroups + g] = combine(carry, excl);
+        barrier();
+        if (t == 0u)
+            carry = combine(carry, sa[255]);
+        barrier();
+    }
+}
+)glsl";
+
+constexpr char kIdctMain[] = R"glsl(
+layout(local_size_x = 256) in;
+#ifdef LINEAR_OUT
+layout(std430, binding = 14) writeonly buffer Rgba { uint rgbaOut[]; };
+#else
+layout(binding = 14, rgba8) uniform writeonly image2D uOut;
+#endif
 
 const int zigzag[64] = int[](
      0,  1,  8, 16,  9,  2,  3, 10,
@@ -889,47 +663,52 @@ int sample_at(int mcu_local, int first_block, int hsf, int vsf, int lx, int ly)
     int block_h = max(pc.yblock / max(vsf, 1), 1);
     int bx = min(lx / block_w, hsf - 1);
     int by = min(ly / block_h, vsf - 1);
-    int spx = ((lx % block_w) * 8) / block_w;
-    int spy = ((ly % block_h) * 8) / block_h;
-    spx = clamp(spx, 0, 7);
-    spy = clamp(spy, 0, 7);
-    int block = mcu_local * pc.blocks_in_mcu + first_block + by * hsf + bx;
+    int spx = clamp(((lx % block_w) * 8) / block_w, 0, 7);
+    int spy = clamp(((ly % block_h) * 8) / block_h, 0, 7);
+    int block = mcu_local * pc.bpm + first_block + by * hsf + bx;
     return nat[block * 64 + spy * 8 + spx];
 }
 
 void main()
 {
     int lane = int(gl_LocalInvocationIndex);
-    int block_slot = lane >> 3;
+    int slot = lane >> 3;
     int col = lane & 7;
-    int group_mcu0 = int(gl_WorkGroupID.x) * pc.mcus_per_group;
-    int mcu_limit = (pc.mcu_y0 + pc.mcu_rows) * pc.xmcu;
-    int used = pc.mcus_per_group * pc.blocks_in_mcu;
+    int group0 = int(gl_WorkGroupID.x) * pc.mcusPerGroup;
+    int used = pc.mcusPerGroup * pc.bpm;
 
     int mcu_local = 0;
     int b = 0;
     bool live = false;
-    if (block_slot < used)
+    if (slot < used)
     {
-        mcu_local = block_slot / pc.blocks_in_mcu;
-        b = block_slot - mcu_local * pc.blocks_in_mcu;
-        // group_mcu0 is local to this dispatch. mcu_limit is an absolute MCU index.
-        live = (group_mcu0 + mcu_local) < pc.mcu_rows * pc.xmcu;
+        mcu_local = slot / pc.bpm;
+        b = slot - mcu_local * pc.bpm;
+        live = (group0 + mcu_local) < pc.nmcu;
     }
 
     if (live)
     {
-        int global_mcu = pc.mcu_y0 * pc.xmcu + group_mcu0 + mcu_local;
-        int base = (global_mcu * pc.blocks_in_mcu + b) * 64;
-        int dst = block_slot * 64;
+        int blk = (group0 + mcu_local) * pc.bpm + b;
+        int dst = slot * 64;
         for (int i = col; i < 64; i += 8)
-            nat[dst + zigzag[i]] = c[base + i];
+        {
+            int v;
+            if (i == 0)
+                v = dcd[blk];
+            else
+            {
+                uint w = coef[uint(blk) * 32u + uint(i >> 1)];
+                v = (i & 1) != 0 ? (int(w) >> 16) : (int(w << 16) >> 16);
+            }
+            nat[dst + zigzag[i]] = v;
+        }
     }
     barrier();
 
     if (live)
     {
-        int dst = block_slot * 64;
+        int dst = slot * 64;
         int qbase = qt_index_of(b) * 64;
         int n0 = nat[dst + col];
         int n1 = nat[dst + col + 8];
@@ -941,16 +720,12 @@ void main()
         int n7 = nat[dst + col + 56];
         if ((n1 | n2 | n3 | n4 | n5 | n6 | n7) != 0)
         {
-            int s0 = n0 * qt[qbase + col];
-            int s1 = n1 * qt[qbase + col + 8];
-            int s2 = n2 * qt[qbase + col + 16];
-            int s3 = n3 * qt[qbase + col + 24];
-            int s4 = n4 * qt[qbase + col + 32];
-            int s5 = n5 * qt[qbase + col + 40];
-            int s6 = n6 * qt[qbase + col + 48];
-            int s7 = n7 * qt[qbase + col + 56];
             int x0, x1, x2, x3, y0, y1, y2, y3;
-            idct_pass(x0, x1, x2, x3, y0, y1, y2, y3, s0, s1, s2, s3, s4, s5, s6, s7);
+            idct_pass(x0, x1, x2, x3, y0, y1, y2, y3,
+                n0 * qt[qbase + col], n1 * qt[qbase + col + 8],
+                n2 * qt[qbase + col + 16], n3 * qt[qbase + col + 24],
+                n4 * qt[qbase + col + 32], n5 * qt[qbase + col + 40],
+                n6 * qt[qbase + col + 48], n7 * qt[qbase + col + 56]);
             const int bias = 0x200;
             x0 += bias; x1 += bias; x2 += bias; x3 += bias;
             tmp[dst + col * 8 + 0] = (x0 + y3) >> 10;
@@ -965,32 +740,20 @@ void main()
         else
         {
             int dc = (n0 * qt[qbase + col]) << 2;
-            tmp[dst + col * 8 + 0] = dc;
-            tmp[dst + col * 8 + 1] = dc;
-            tmp[dst + col * 8 + 2] = dc;
-            tmp[dst + col * 8 + 3] = dc;
-            tmp[dst + col * 8 + 4] = dc;
-            tmp[dst + col * 8 + 5] = dc;
-            tmp[dst + col * 8 + 6] = dc;
-            tmp[dst + col * 8 + 7] = dc;
+            for (int k = 0; k < 8; ++k)
+                tmp[dst + col * 8 + k] = dc;
         }
     }
     barrier();
 
     if (live)
     {
-        int dst = block_slot * 64;
+        int dst = slot * 64;
         int row = col;
-        int s0 = tmp[dst + row];
-        int s1 = tmp[dst + row + 8];
-        int s2 = tmp[dst + row + 16];
-        int s3 = tmp[dst + row + 24];
-        int s4 = tmp[dst + row + 32];
-        int s5 = tmp[dst + row + 40];
-        int s6 = tmp[dst + row + 48];
-        int s7 = tmp[dst + row + 56];
         int x0, x1, x2, x3, y0, y1, y2, y3;
-        idct_pass(x0, x1, x2, x3, y0, y1, y2, y3, s0, s1, s2, s3, s4, s5, s6, s7);
+        idct_pass(x0, x1, x2, x3, y0, y1, y2, y3,
+            tmp[dst + row], tmp[dst + row + 8], tmp[dst + row + 16], tmp[dst + row + 24],
+            tmp[dst + row + 32], tmp[dst + row + 40], tmp[dst + row + 48], tmp[dst + row + 56]);
         const int shift = 17;
         const int bias = 0x10000 + (128 << shift);
         x0 += bias; x1 += bias; x2 += bias; x3 += bias;
@@ -1006,20 +769,18 @@ void main()
     barrier();
 
     int area = pc.xblock * pc.yblock;
-    int span = pc.mcus_per_group * area;
+    int span = pc.mcusPerGroup * area;
     for (int p = lane; p < span; p += 256)
     {
         int mcu_i = p / area;
         int pix = p - mcu_i * area;
-        int global_mcu = pc.mcu_y0 * pc.xmcu + group_mcu0 + mcu_i;
-        if (global_mcu >= mcu_limit)
+        int global_mcu = group0 + mcu_i;
+        if (global_mcu >= pc.nmcu)
             continue;
         int lx = pix % pc.xblock;
         int ly = pix / pc.xblock;
-        int mcu_x = global_mcu % pc.xmcu;
-        int mcu_y = global_mcu / pc.xmcu;
-        int px = mcu_x * pc.xblock + lx;
-        int py = mcu_y * pc.yblock + ly;
+        int px = (global_mcu % pc.xmcu) * pc.xblock + lx;
+        int py = (global_mcu / pc.xmcu) * pc.yblock + ly;
         if (px >= pc.width || py >= pc.height)
             continue;
 
@@ -1037,93 +798,56 @@ void main()
             G = clamp_u8(Y - ((Cb * 22554 + Cr * 46802) >> 16));
             B = clamp_u8(Y + ((Cb * 116130) >> 16));
         }
+#ifdef LINEAR_OUT
+        rgbaOut[py * pc.width + px] = uint(R) | (uint(G) << 8) | (uint(B) << 16) | 0xff000000u;
+#else
         imageStore(uOut, ivec2(px, py), vec4(float(R), float(G), float(B), 255.0) / 255.0);
+#endif
     }
 }
 )glsl";
 
-void buildTable(const mango::image::jpeg::HuffmanCodeTable& src, TableGpu& dst)
+int symEntryHost(int sym, int len, bool dc)
 {
-    std::memset(&dst, 0, sizeof(dst));
-    for (int i = 0; i < 16; ++i)
-        dst.maxcode[i] = -1;
+    int s = sym & 15;
+    int r = sym >> 4;
+    int za = dc ? 1 : (s ? r + 1 : (r == 15 ? 16 : 64));
+    return (len + s) | (s << 5) | (za << 9);
+}
 
-    int huffsize[257] = {};
-    std::uint32_t huffcode[257] = {};
+void buildSlot(const mango::image::jpeg::HuffmanCodeTable& src, bool dc,
+    std::vector<std::uint16_t>& lut, std::vector<std::uint8_t>& hv, TablesGpu& dst, int slot)
+{
+    for (int i = 0; i < 18; ++i)
+        dst.maxc[slot * 18 + i] = -1;
+    dst.maxc[slot * 18 + 17] = 0x7fffffff;
+    int code = 0;
     int p = 0;
     for (int len = 1; len <= 16; ++len)
     {
-        int n = src.bits[len - 1];
-        while (n-- > 0 && p < 256)
-            huffsize[p++] = len;
-    }
-    huffsize[p] = 0;
-
-    std::uint32_t code = 0;
-    int si = huffsize[0];
-    int q = 0;
-    while (huffsize[q])
-    {
-        while (huffsize[q] == si)
-            huffcode[q++] = code++;
-        code <<= 1;
-        ++si;
-    }
-
-    p = 0;
-    for (int len = 1; len <= 16; ++len)
-    {
-        int n = src.bits[len - 1];
-        if (!n)
-            continue;
-        dst.valptr[len - 1] = p;
-        dst.mincode[len - 1] = std::int32_t(huffcode[p]);
-        p += n;
-        dst.maxcode[len - 1] = std::int32_t(huffcode[p - 1]);
-    }
-
-    const int nvalues = std::min(src.nvalues, 256);
-    for (int i = 0; i < nvalues; ++i)
-        dst.vals[i] = src.values[i];
-
-    p = 0;
-    for (int len = 1; len <= 16; ++len)
-    {
-        int n = src.bits[len - 1];
-        for (int i = 0; i < n && p < 256; ++i, ++p)
+        int nl = src.bits[len - 1];
+        if (nl)
         {
-            if (len > 8)
-                continue;
-            const std::uint32_t c = huffcode[p];
-            const std::uint32_t sym = src.values[p];
-            const int shift = 8 - len;
-            const std::uint32_t base = c << shift;
-            const std::uint32_t count = 1u << shift;
-            for (std::uint32_t k = 0; k < count; ++k)
-                dst.lut[base + k] = std::uint32_t(len) | (sym << 8);
+            dst.voff[slot * 18 + len] = p - code;
+            for (int k = 0; k < nl && p + k < 256; ++k)
+            {
+                int sym = src.values[p + k];
+                hv[slot * 256 + p + k] = std::uint8_t(sym);
+                if (len <= kLb)
+                {
+                    int lo = (code + k) << (kLb - len);
+                    int n = 1 << (kLb - len);
+                    std::uint16_t ent = std::uint16_t(symEntryHost(sym, len, dc));
+                    for (int i = 0; i < n; ++i)
+                        lut[slot * kLut + lo + i] = ent;
+                }
+            }
+            p += nl;
+            code += nl;
+            dst.maxc[slot * 18 + len] = code - 1;
         }
+        code <<= 1;
     }
-}
-
-bool submitAndWait(VkQueue queue, VkCommandBuffer cmd, VkFence fence, VkDevice device,
-    std::uint64_t timeout_ns, std::string& error)
-{
-    vkResetFences(device, 1, &fence);
-    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
-    {
-        error = "vkQueueSubmit failed";
-        return false;
-    }
-    const VkResult wr = vkWaitForFences(device, 1, &fence, VK_TRUE, timeout_ns);
-    if (wr != VK_SUCCESS)
-    {
-        error = wr == VK_TIMEOUT ? "gpu2 fence timed out" : "vkWaitForFences failed";
-        return false;
-    }
-    return true;
 }
 
 void memBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
@@ -1137,6 +861,12 @@ void memBarrier(VkCommandBuffer cmd, VkAccessFlags src, VkAccessFlags dst,
     vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void computeBarrier(VkCommandBuffer cmd)
+{
+    memBarrier(cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
 } // namespace
 
 bool MangoGpu2Decoder::extract(mango::ConstMemory jpeg, std::string& error)
@@ -1146,6 +876,7 @@ bool MangoGpu2Decoder::extract(mango::ConstMemory jpeg, std::string& error)
     uploaded = false;
     m_jpeg = jpeg;
     m_pipeline = false;
+    m_static_copied = false;
 
     const mango::u64 t0 = nowUs();
     mango::image::jpeg::JpegDecoder decoder(jpeg);
@@ -1179,39 +910,181 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     if (uploaded)
         return true;
 
-    if (m_bits)
-        allocator.destroyBuffer(m_bits);
-    m_bits = {};
-
     const mango::u64 t0 = nowUs();
-    const VkDeviceSize payload = VkDeviceSize(stream.packed_bytes);
-    const VkDeviceSize bit_bytes = (payload + 16u + 3u) & ~VkDeviceSize(3);
-    m_bits = allocator.createBuffer(
-        bit_bytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        mango::vulkan::MemoryUsage::Upload,
-        true);
-    if (!m_bits || !m_bits.mapped)
+    const int bpm = stream.blocks_in_mcu;
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(stream.packed_bytes + 64);
+    std::vector<ChunkGpu> chunk_host;
+    std::vector<SegGpu> seg_host;
+    std::uint32_t bit = 0;
+    int block = 0;
+    int mcu = 0;
+    for (const auto& seg : stream.segments)
     {
-        error = "entropy upload buffer failed";
+        const std::uint32_t seg_bit = bit;
+        const std::uint8_t* p = seg.bytes.address;
+        bool ff = false;
+        for (size_t i = 0; i < seg.bytes.size; ++i)
+        {
+            const std::uint8_t b = p[i];
+            if (ff && b == 0)
+            {
+                ff = false;
+                continue;
+            }
+            ff = b == 0xff;
+            bytes.push_back(b);
+            bit += 8;
+        }
+        const std::uint32_t seg_end = bit;
+        SegGpu sg = {};
+        sg.chunk0 = int(chunk_host.size());
+        sg.block0 = block;
+        sg.mcu0 = mcu;
+        sg.mcus = seg.mcus;
+        for (std::uint32_t at = seg_bit; at < seg_end; at += kChunkBits)
+        {
+            ChunkGpu c = {};
+            c.bit0 = at;
+            c.bit1 = std::min(at + kChunkBits, seg_end);
+            c.seg0 = seg_bit;
+            c.seg1 = seg_end;
+            c.block0 = block;
+            c.block1 = block + seg.mcus * bpm;
+            chunk_host.push_back(c);
+        }
+        sg.nchunks = int(chunk_host.size()) - sg.chunk0;
+        seg_host.push_back(sg);
+        block += seg.mcus * bpm;
+        mcu += seg.mcus;
+    }
+    if (chunk_host.empty())
+    {
+        error = "no entropy chunks";
+        return false;
+    }
+    chunks = int(chunk_host.size());
+    m_nblk = block;
+    m_nsegs = int(seg_host.size());
+
+    const size_t nbytes = ((bytes.size() + 3u) & ~size_t(3)) + 32u;
+    bytes.resize(nbytes, 0);
+    m_nwords = std::uint32_t(nbytes / 4);
+
+    TablesGpu tab = {};
+    std::vector<std::uint16_t> lut(8 * kLut, 0);
+    std::vector<std::uint8_t> hv(8 * 256, 0);
+    for (const auto& table : stream.huffman)
+    {
+        const int slot = table.cls * 4 + table.id;
+        if (slot < 0 || slot >= 8)
+        {
+            error = "Huffman table id is outside 0..3";
+            return false;
+        }
+        buildSlot(table, table.cls == 0, lut, hv, tab, slot);
+    }
+    for (int i = 0; i < 8 * kLut / 2; ++i)
+        tab.lut[i] = std::uint32_t(lut[2 * i]) | (std::uint32_t(lut[2 * i + 1]) << 16);
+    for (int i = 0; i < 8 * 256 / 4; ++i)
+    {
+        tab.hv[i] = std::uint32_t(hv[4 * i]) | (std::uint32_t(hv[4 * i + 1]) << 8)
+            | (std::uint32_t(hv[4 * i + 2]) << 16) | (std::uint32_t(hv[4 * i + 3]) << 24);
+    }
+
+    m_dc_pack = m_ac_pack = m_comp_pack = 0;
+    for (int b = 0; b < bpm; ++b)
+    {
+        const auto& info = stream.block[b];
+        m_dc_pack |= std::uint32_t(info.dc & 7) << (3 * b);
+        m_ac_pack |= std::uint32_t((4 + info.ac) & 7) << (3 * b);
+        m_comp_pack |= std::uint32_t(info.component & 3) << (2 * b);
+    }
+
+    std::int32_t natural_qt[4 * 64] = {};
+    {
+        mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
+        const mango::image::jpeg::JpegInfo& info = info_decoder.info();
+        for (int t = 0; t < 4; ++t)
+        {
+            if (!info.quant[t])
+                continue;
+            for (int i = 0; i < 64; ++i)
+                natural_qt[t * 64 + i] = info.quant[t][i];
+        }
+    }
+
+    using mango::vulkan::MemoryUsage;
+    auto staging = [&](mango::vulkan::BufferAllocation& buf, const void* src, size_t size) -> bool
+    {
+        buf = allocator.createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload, true);
+        if (!buf || !buf.mapped)
+            return false;
+        std::memcpy(buf.mapped, src, size);
+        allocator.flush(buf.allocation, 0, size);
+        return true;
+    };
+    auto device = [&](mango::vulkan::BufferAllocation& buf, size_t size, bool dst) -> bool
+    {
+        VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (dst)
+            usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        buf = allocator.createBuffer(std::max<size_t>(size, 16), usage, MemoryUsage::GpuOnly, false);
+        return bool(buf);
+    };
+
+    // The bitstream goes word-swapped so the shader reads big-endian words directly.
+    std::vector<std::uint32_t> words(m_nwords);
+    for (std::uint32_t i = 0; i < m_nwords; ++i)
+    {
+        const std::uint8_t* b = bytes.data() + i * 4;
+        words[i] = (std::uint32_t(b[0]) << 24) | (std::uint32_t(b[1]) << 16)
+            | (std::uint32_t(b[2]) << 8) | std::uint32_t(b[3]);
+    }
+
+    const size_t nch = chunk_host.size();
+    const int nmcu = stream.xmcu * stream.ymcu;
+    const int nblk_alloc = std::max(m_nblk, nmcu * bpm);
+    const int dc_groups = (nmcu + kDcTile - 1) / kDcTile;
+    std::vector<std::uint32_t> seg_start(size_t(nmcu + 31) / 32 + 1, 0u);
+    for (const SegGpu& sg : seg_host)
+    {
+        if (sg.mcu0 < nmcu)
+            seg_start[size_t(sg.mcu0) >> 5] |= 1u << (sg.mcu0 & 31);
+    }
+    const bool ok =
+        staging(m_bits, words.data(), words.size() * 4)
+        && staging(m_chunks_host, chunk_host.data(), nch * sizeof(ChunkGpu))
+        && staging(m_segs_host, seg_host.data(), seg_host.size() * sizeof(SegGpu))
+        && staging(m_tables_host, &tab, sizeof(tab))
+        && staging(m_qt_host, natural_qt, sizeof(natural_qt))
+        && device(m_bits_dev, words.size() * 4, true)
+        && device(m_chunks, nch * sizeof(ChunkGpu), true)
+        && device(m_segs, seg_host.size() * sizeof(SegGpu), true)
+        && device(m_tables, sizeof(tab), true)
+        && device(m_qt, sizeof(natural_qt), true)
+        && device(m_st_in, nch * 8, false)
+        && device(m_st_out, nch * 8, false)
+        && device(m_cnt, nch * 4, false)
+        && device(m_cps, nch * kNcp * 8, false)
+        && device(m_cpc, nch * kNcp * 4, false)
+        && device(m_first, nch * 4, false)
+        && device(m_coef, size_t(nblk_alloc) * 32 * 4, true)
+        && device(m_dcd, size_t(nblk_alloc) * 4, true)
+        && device(m_flags, kMaxPasses * 4, true)
+        && staging(m_seg_start_host, seg_start.data(), seg_start.size() * 4)
+        && device(m_seg_start, seg_start.size() * 4, true)
+        && device(m_agg, size_t(dc_groups) * 2 * 16, false);
+    if (!ok)
+    {
+        error = "gpu2 buffer allocation failed";
         release(allocator);
         return false;
     }
-    auto* dst = static_cast<std::uint8_t*>(m_bits.mapped);
-    for (const mango::image::jpeg::EntropySegment& seg : stream.segments)
-    {
-        if (!seg.bytes.address || seg.packed_offset + seg.bytes.size > stream.packed_bytes)
-        {
-            error = "entropy segment is outside the packed buffer";
-            release(allocator);
-            return false;
-        }
-        std::memcpy(dst + seg.packed_offset, seg.bytes.address, seg.bytes.size);
-    }
-    if (bit_bytes > payload)
-        std::memset(dst + payload, 0, std::size_t(bit_bytes - payload));
-    allocator.flush(m_bits.allocation, 0, bit_bytes);
-    m_bit_bytes = bit_bytes;
+
+    m_seg_start_words = std::uint32_t(seg_start.size());
+    m_static_copied = false;
     upload_us = nowUs() - t0;
     uploaded = true;
     return true;
@@ -1219,79 +1092,253 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
 
 void MangoGpu2Decoder::release(mango::vulkan::Allocator& allocator)
 {
-    auto drop = [&](mango::vulkan::BufferAllocation& buf)
-    {
-        if (buf)
-            allocator.destroyBuffer(buf);
-        buf = {};
+    mango::vulkan::BufferAllocation* all[] = {
+        &m_bits, &m_chunks_host, &m_segs_host, &m_tables_host, &m_qt_host,
+        &m_bits_dev, &m_chunks, &m_segs, &m_tables, &m_qt,
+        &m_st_in, &m_st_out, &m_cnt, &m_cps, &m_cpc, &m_first, &m_coef, &m_dcd, &m_flags,
+        &m_seg_start_host, &m_seg_start, &m_agg,
     };
-    drop(m_bits);
-    drop(m_bits_dev);
-    drop(m_chunks);
-    drop(m_tables);
-    drop(m_coeffs);
-    drop(m_state);
-    drop(m_entry);
-    drop(m_cps);
-    drop(m_segs);
-    drop(m_qt);
+    for (auto* buf : all)
+    {
+        if (*buf)
+            allocator.destroyBuffer(*buf);
+        *buf = {};
+    }
 
     if (m_device)
     {
-        if (m_sync_pipe)
-            vkDestroyPipeline(m_device, m_sync_pipe, nullptr);
-        if (m_sync_pipe_layout)
-            vkDestroyPipelineLayout(m_device, m_sync_pipe_layout, nullptr);
-        if (m_sync_layout)
-            vkDestroyDescriptorSetLayout(m_device, m_sync_layout, nullptr);
-        if (m_sync_pool)
-            vkDestroyDescriptorPool(m_device, m_sync_pool, nullptr);
-        if (m_sync_shader)
-            vkDestroyShaderModule(m_device, m_sync_shader, nullptr);
-        if (m_prefix_pipe)
-            vkDestroyPipeline(m_device, m_prefix_pipe, nullptr);
-        if (m_prefix_pipe_layout)
-            vkDestroyPipelineLayout(m_device, m_prefix_pipe_layout, nullptr);
-        if (m_prefix_layout)
-            vkDestroyDescriptorSetLayout(m_device, m_prefix_layout, nullptr);
-        if (m_prefix_pool)
-            vkDestroyDescriptorPool(m_device, m_prefix_pool, nullptr);
-        if (m_prefix_shader)
-            vkDestroyShaderModule(m_device, m_prefix_shader, nullptr);
-        if (m_idct_pipe)
-            vkDestroyPipeline(m_device, m_idct_pipe, nullptr);
-        if (m_idct_pipe_layout)
-            vkDestroyPipelineLayout(m_device, m_idct_pipe_layout, nullptr);
-        if (m_idct_layout)
-            vkDestroyDescriptorSetLayout(m_device, m_idct_layout, nullptr);
-        if (m_idct_pool)
-            vkDestroyDescriptorPool(m_device, m_idct_pool, nullptr);
-        if (m_idct_shader)
-            vkDestroyShaderModule(m_device, m_idct_shader, nullptr);
+        for (int i = 0; i < PipeCount; ++i)
+        {
+            if (m_pipes[i])
+                vkDestroyPipeline(m_device, m_pipes[i], nullptr);
+            if (m_shaders[i])
+                vkDestroyShaderModule(m_device, m_shaders[i], nullptr);
+            m_pipes[i] = VK_NULL_HANDLE;
+            m_shaders[i] = VK_NULL_HANDLE;
+        }
+        if (m_pipe_layout)
+            vkDestroyPipelineLayout(m_device, m_pipe_layout, nullptr);
+        if (m_layout)
+            vkDestroyDescriptorSetLayout(m_device, m_layout, nullptr);
+        if (m_desc_pool)
+            vkDestroyDescriptorPool(m_device, m_desc_pool, nullptr);
+        if (m_queries)
+            vkDestroyQueryPool(m_device, m_queries, nullptr);
         if (m_pool)
             vkDestroyCommandPool(m_device, m_pool, nullptr);
         if (m_fence)
             vkDestroyFence(m_device, m_fence, nullptr);
     }
-    m_sync_pipe = m_prefix_pipe = m_idct_pipe = VK_NULL_HANDLE;
-    m_sync_pipe_layout = m_prefix_pipe_layout = m_idct_pipe_layout = VK_NULL_HANDLE;
-    m_sync_layout = m_prefix_layout = m_idct_layout = VK_NULL_HANDLE;
-    m_sync_pool = m_prefix_pool = m_idct_pool = VK_NULL_HANDLE;
-    m_sync_set = m_prefix_set = m_idct_set = VK_NULL_HANDLE;
-    m_sync_shader = m_prefix_shader = m_idct_shader = VK_NULL_HANDLE;
+    m_pipe_layout = VK_NULL_HANDLE;
+    m_layout = VK_NULL_HANDLE;
+    m_desc_pool = VK_NULL_HANDLE;
+    m_set = VK_NULL_HANDLE;
+    m_queries = VK_NULL_HANDLE;
     m_pool = VK_NULL_HANDLE;
     m_cmd = VK_NULL_HANDLE;
     m_fence = VK_NULL_HANDLE;
     m_device = VK_NULL_HANDLE;
     m_queue = VK_NULL_HANDLE;
     m_pipeline = false;
-    m_bit_bytes = 0;
+    m_static_copied = false;
     uploaded = false;
+}
+
+bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, DecodedTexture& texture,
+    std::string& error)
+{
+    const mango::u64 t_compile = nowUs();
+    m_linear = bool(texture.publish_alloc);
+    mango::vulkan::Compiler compiler;
+    const std::string sources[PipeCount] = {
+        std::string(kCommon) + kHuffman + kSyncMain,
+        std::string(kCommon) + kPrefixMain,
+        std::string(kCommon) + kHuffman + kWriteMain,
+        std::string(kCommon) + kDcScan + kDcLocalMain,
+        std::string(kCommon) + kDcScan + kDcGroupsMain,
+        std::string(kCommon) + (m_linear ? "#define LINEAR_OUT 1\n" : "") + kIdctMain,
+    };
+    for (int i = 0; i < PipeCount; ++i)
+    {
+        mango::vulkan::Shader shader = compiler.compile(sources[i].c_str(), mango::vulkan::ShaderStage::Compute);
+        if (!shader)
+        {
+            error = std::string("gpu2 shader compile failed:\n") + shader.log;
+            return false;
+        }
+        m_shaders[i] = mango::vulkan::Compiler::createShaderModule(m_device, shader);
+        if (!m_shaders[i])
+        {
+            error = "gpu2 shader module failed";
+            return false;
+        }
+    }
+
+    VkDescriptorSetLayoutBinding bindings[kBindings] = {};
+    for (std::uint32_t i = 0; i < kBindings; ++i)
+    {
+        const bool image = i == kImageBinding && !m_linear;
+        bindings[i] = { i, image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    }
+    VkDescriptorSetLayoutCreateInfo set_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = kBindings,
+        .pBindings = bindings,
+    };
+    if (vkCreateDescriptorSetLayout(m_device, &set_info, nullptr, &m_layout) != VK_SUCCESS)
+    {
+        error = "gpu2 descriptor layout failed";
+        return false;
+    }
+    VkPushConstantRange push = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push) };
+    VkPipelineLayoutCreateInfo pl = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &m_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    };
+    if (vkCreatePipelineLayout(m_device, &pl, nullptr, &m_pipe_layout) != VK_SUCCESS)
+    {
+        error = "gpu2 pipeline layout failed";
+        return false;
+    }
+    for (int i = 0; i < PipeCount; ++i)
+    {
+        VkComputePipelineCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = m_shaders[i],
+                .pName = "main",
+            },
+            .layout = m_pipe_layout,
+        };
+        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, &m_pipes[i]) != VK_SUCCESS)
+        {
+            error = "gpu2 pipeline failed";
+            return false;
+        }
+    }
+
+    VkDescriptorPoolSize sizes[2] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, m_linear ? std::uint32_t(kBindings) : std::uint32_t(kBindings - 1) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+    };
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = m_linear ? 1u : 2u,
+        .pPoolSizes = sizes,
+    };
+    if (vkCreateDescriptorPool(m_device, &pool_info, nullptr, &m_desc_pool) != VK_SUCCESS)
+    {
+        error = "gpu2 descriptor pool failed";
+        return false;
+    }
+    VkDescriptorSetAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = m_desc_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &m_layout,
+    };
+    if (vkAllocateDescriptorSets(m_device, &ai, &m_set) != VK_SUCCESS)
+    {
+        error = "gpu2 descriptor set failed";
+        return false;
+    }
+
+    const VkBuffer buffers[kBindings] = {
+        m_bits_dev.buffer, m_chunks.buffer, m_segs.buffer, m_tables.buffer,
+        m_st_in.buffer, m_st_out.buffer, m_cnt.buffer, m_cps.buffer, m_cpc.buffer,
+        m_first.buffer, m_coef.buffer, m_dcd.buffer, m_qt.buffer, m_flags.buffer,
+        m_linear ? texture.publish_alloc.buffer : VK_NULL_HANDLE, m_seg_start.buffer, m_agg.buffer,
+    };
+    VkDescriptorBufferInfo buf_infos[kBindings] = {};
+    VkWriteDescriptorSet writes[kBindings] = {};
+    for (std::uint32_t i = 0; i < kBindings; ++i)
+    {
+        if (i == kImageBinding && !m_linear)
+            continue;
+        buf_infos[i] = { buffers[i], 0, VK_WHOLE_SIZE };
+        writes[i] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buf_infos[i],
+        };
+    }
+    VkDescriptorImageInfo img_info = {
+        .sampler = VK_NULL_HANDLE,
+        .imageView = texture.view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    if (!m_linear)
+    {
+        writes[kImageBinding] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = m_set,
+            .dstBinding = kImageBinding,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &img_info,
+        };
+    }
+    vkUpdateDescriptorSets(m_device, kBindings, writes, 0, nullptr);
+
+    VkCommandPoolCreateInfo pool_ci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = window.graphicsQueueFamilyIndex(),
+    };
+    if (vkCreateCommandPool(m_device, &pool_ci, nullptr, &m_pool) != VK_SUCCESS)
+    {
+        error = "gpu2 command pool failed";
+        return false;
+    }
+    VkCommandBufferAllocateInfo cmd_ai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = m_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(m_device, &cmd_ai, &m_cmd) != VK_SUCCESS)
+    {
+        error = "gpu2 command buffer failed";
+        return false;
+    }
+    VkFenceCreateInfo fence_ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateFence(m_device, &fence_ci, nullptr, &m_fence) != VK_SUCCESS)
+    {
+        error = "gpu2 fence failed";
+        return false;
+    }
+
+    VkPhysicalDeviceProperties props = {};
+    vkGetPhysicalDeviceProperties(window.physicalDevice(), &props);
+    m_tick_ns = props.limits.timestampPeriod;
+    VkQueryPoolCreateInfo qp = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 8,
+    };
+    if (m_tick_ns <= 0.0f || vkCreateQueryPool(m_device, &qp, nullptr, &m_queries) != VK_SUCCESS)
+        m_queries = VK_NULL_HANDLE;
+
+    compile_us = nowUs() - t_compile;
+    compile_last_us = compile_us;
+    m_pipeline = true;
+    return true;
 }
 
 bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     mango::vulkan::Allocator& allocator, DecodedTexture& texture, std::string& error)
 {
+    (void)allocator;
     if (!uploaded)
     {
         error = "entropy buffer is not uploaded";
@@ -1306,425 +1353,27 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     m_device = window.device();
     m_queue = window.graphicsQueue();
     compile_last_us = 0;
-    decode_us = 0;
+    decode_us = huffman_us = pixel_us = wall_us = 0;
 
-    const int bpm = std::max(stream.blocks_in_mcu, 1);
-    std::vector<ChunkGpu> chunk_host;
-    std::vector<SegInfoGpu> seg_host;
-    chunk_host.reserve(stream.packed_bytes / kChunkBytes + stream.segments.size());
-    for (size_t s = 0; s < stream.segments.size(); ++s)
-    {
-        const auto& seg = stream.segments[s];
-        if (seg.bytes.size == 0)
-            continue;
-        SegInfoGpu info = {};
-        info.chunk0 = std::uint32_t(chunk_host.size());
-        info.baseCoeff = std::uint32_t(seg.mcu_y0) * std::uint32_t(stream.xmcu) * std::uint32_t(bpm) * 64u;
-        const std::uint32_t coeff_end = info.baseCoeff
-            + std::uint32_t(seg.mcus) * std::uint32_t(bpm) * 64u;
-        const std::uint32_t origin = std::uint32_t(seg.packed_offset);
-        const std::uint32_t size = std::uint32_t(seg.bytes.size);
-        for (std::uint32_t off = 0; off < size; off += kChunkBytes)
-        {
-            ChunkGpu c = {};
-            c.begin = origin + off;
-            c.end = c.begin + std::min(kChunkBytes, size - off);
-            c.segBegin = origin;
-            c.segEnd = origin + size;
-            c.seg = std::uint32_t(s);
-            c.baseCoeff = info.baseCoeff;
-            c.coeffEnd = coeff_end;
-            chunk_host.push_back(c);
-        }
-        info.nchunks = std::uint32_t(chunk_host.size()) - info.chunk0;
-        seg_host.push_back(info);
-    }
-    if (chunk_host.empty() || seg_host.empty())
-    {
-        error = "no entropy chunks";
+    if (!m_pipeline && !createPipelines(window, texture, error))
         return false;
-    }
-    chunks = int(chunk_host.size());
-
-    if (!m_pipeline)
-    {
-        const mango::u64 t_compile = nowUs();
-        mango::vulkan::Compiler compiler;
-        auto module_from = [&](const char* source, VkShaderModule& out) -> bool
-        {
-            mango::vulkan::Shader shader = compiler.compile(source, mango::vulkan::ShaderStage::Compute);
-            if (!shader)
-            {
-                error = std::string("gpu2 shader compile failed:\n") + shader.log;
-                return false;
-            }
-            out = mango::vulkan::Compiler::createShaderModule(m_device, shader);
-            return out != VK_NULL_HANDLE;
-        };
-        if (!module_from(kSyncSource, m_sync_shader) || !module_from(kPrefixSource, m_prefix_shader)
-            || !module_from(kIdctSource, m_idct_shader))
-            return false;
-
-        auto make_layout = [&](VkDescriptorSetLayoutBinding* bindings, uint32_t n, VkDescriptorSetLayout& layout,
-                                VkPushConstantRange* push, VkPipelineLayout& pipe_layout) -> bool
-        {
-            VkDescriptorSetLayoutCreateInfo set_info = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                .bindingCount = n,
-                .pBindings = bindings,
-            };
-            if (vkCreateDescriptorSetLayout(m_device, &set_info, nullptr, &layout) != VK_SUCCESS)
-            {
-                error = "gpu2 descriptor layout failed";
-                return false;
-            }
-            VkPipelineLayoutCreateInfo pl = {
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                .setLayoutCount = 1,
-                .pSetLayouts = &layout,
-                .pushConstantRangeCount = push ? 1u : 0u,
-                .pPushConstantRanges = push,
-            };
-            if (vkCreatePipelineLayout(m_device, &pl, nullptr, &pipe_layout) != VK_SUCCESS)
-            {
-                error = "gpu2 pipeline layout failed";
-                return false;
-            }
-            return true;
-        };
-        auto make_pipe = [&](VkShaderModule shader, VkPipelineLayout layout, VkPipeline& pipe) -> bool
-        {
-            VkComputePipelineCreateInfo info = {
-                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                .stage = {
-                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                    .module = shader,
-                    .pName = "main",
-                },
-                .layout = layout,
-            };
-            if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, &pipe) != VK_SUCCESS)
-            {
-                error = "gpu2 pipeline failed";
-                return false;
-            }
-            return true;
-        };
-
-        VkDescriptorSetLayoutBinding sync_bindings[7] = {};
-        for (uint32_t i = 0; i < 7; ++i)
-            sync_bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        VkPushConstantRange sync_push = {
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = sizeof(SyncPush),
-        };
-        if (!make_layout(sync_bindings, 7, m_sync_layout, &sync_push, m_sync_pipe_layout)
-            || !make_pipe(m_sync_shader, m_sync_pipe_layout, m_sync_pipe))
-            return false;
-
-        VkDescriptorSetLayoutBinding prefix_bindings[3] = {};
-        for (uint32_t i = 0; i < 3; ++i)
-            prefix_bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
-        if (!make_layout(prefix_bindings, 3, m_prefix_layout, nullptr, m_prefix_pipe_layout)
-            || !make_pipe(m_prefix_shader, m_prefix_pipe_layout, m_prefix_pipe))
-            return false;
-
-        VkDescriptorSetLayoutBinding idct_bindings[3] = {
-            { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        };
-        VkPushConstantRange idct_push = {
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = sizeof(IdctPush),
-        };
-        if (!make_layout(idct_bindings, 3, m_idct_layout, &idct_push, m_idct_pipe_layout)
-            || !make_pipe(m_idct_shader, m_idct_pipe_layout, m_idct_pipe))
-            return false;
-
-        VkCommandPoolCreateInfo pool_ci = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-            .queueFamilyIndex = window.graphicsQueueFamilyIndex(),
-        };
-        if (vkCreateCommandPool(m_device, &pool_ci, nullptr, &m_pool) != VK_SUCCESS)
-        {
-            error = "gpu2 command pool failed";
-            return false;
-        }
-        VkCommandBufferAllocateInfo cmd_ai = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = m_pool,
-            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
-        };
-        if (vkAllocateCommandBuffers(m_device, &cmd_ai, &m_cmd) != VK_SUCCESS)
-        {
-            error = "gpu2 command buffer failed";
-            return false;
-        }
-        VkFenceCreateInfo fence_ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        if (vkCreateFence(m_device, &fence_ci, nullptr, &m_fence) != VK_SUCCESS)
-        {
-            error = "gpu2 fence failed";
-            return false;
-        }
-
-        m_bits_dev = allocator.createBuffer(m_bit_bytes,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            mango::vulkan::MemoryUsage::GpuOnly, false);
-        m_chunks = allocator.createBuffer(chunk_host.size() * sizeof(ChunkGpu),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
-        m_segs = allocator.createBuffer(seg_host.size() * sizeof(SegInfoGpu),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
-        const std::uint64_t samples = std::uint64_t(stream.ymcu) * std::uint64_t(stream.xmcu)
-            * std::uint64_t(bpm) * 64ull;
-        m_coeffs = allocator.createBuffer(samples * sizeof(std::int32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            mango::vulkan::MemoryUsage::GpuOnly, false);
-        m_state = allocator.createBuffer(VkDeviceSize(chunk_host.size()) * kStateWords * sizeof(std::uint32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::GpuOnly, false);
-        m_entry = allocator.createBuffer(chunk_host.size() * sizeof(std::uint32_t) * 5u,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::GpuOnly, false);
-        m_cps = allocator.createBuffer(chunk_host.size() * 4u * 10u * sizeof(std::uint32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            mango::vulkan::MemoryUsage::GpuOnly, false);
-        if (!m_bits_dev || !m_chunks || !m_chunks.mapped || !m_segs || !m_segs.mapped
-            || !m_coeffs || !m_state || !m_entry || !m_cps)
-        {
-            error = "gpu2 buffer allocation failed";
-            return false;
-        }
-
-        TablesFlat flat = {};
-        for (int i = 0; i < 128; ++i)
-            flat.maxcode[i] = -1;
-        for (const auto& table : stream.huffman)
-        {
-            const int index = table.cls * 4 + table.id;
-            if (index < 0 || index >= 8)
-            {
-                error = "Huffman table id is outside 0..3";
-                return false;
-            }
-            TableGpu built = {};
-            buildTable(table, built);
-            for (int i = 0; i < 16; ++i)
-            {
-                flat.mincode[index * 16 + i] = built.mincode[i];
-                flat.maxcode[index * 16 + i] = built.maxcode[i];
-                flat.valptr[index * 16 + i] = built.valptr[i];
-            }
-            std::memcpy(flat.lut + index * 256, built.lut, sizeof(built.lut));
-            std::memcpy(flat.vals + index * 256, built.vals, sizeof(built.vals));
-        }
-        m_tables = allocator.createBuffer(sizeof(flat),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
-        if (!m_tables || !m_tables.mapped)
-        {
-            error = "Huffman table buffer failed";
-            return false;
-        }
-        std::memcpy(m_tables.mapped, &flat, sizeof(flat));
-        allocator.flush(m_tables.allocation, 0, sizeof(flat));
-
-        std::int32_t natural_qt[4 * 64] = {};
-        {
-            mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
-            const mango::image::jpeg::JpegInfo& info = info_decoder.info();
-            for (int t = 0; t < 4; ++t)
-            {
-                if (!info.quant[t])
-                    continue;
-                for (int i = 0; i < 64; ++i)
-                    natural_qt[t * 64 + i] = info.quant[t][i];
-            }
-        }
-        m_qt = allocator.createBuffer(sizeof(natural_qt),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, mango::vulkan::MemoryUsage::Upload, true);
-        if (!m_qt || !m_qt.mapped)
-        {
-            error = "quant table buffer failed";
-            return false;
-        }
-        std::memcpy(m_qt.mapped, natural_qt, sizeof(natural_qt));
-        allocator.flush(m_qt.allocation, 0, sizeof(natural_qt));
-
-        auto pool_and_set = [&](VkDescriptorType type, uint32_t n, VkDescriptorSetLayout layout,
-                                VkDescriptorPool& pool, VkDescriptorSet& set) -> bool
-        {
-            VkDescriptorPoolSize size = { type, n };
-            VkDescriptorPoolCreateInfo info = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .maxSets = 1,
-                .poolSizeCount = 1,
-                .pPoolSizes = &size,
-            };
-            if (vkCreateDescriptorPool(m_device, &info, nullptr, &pool) != VK_SUCCESS)
-            {
-                error = "gpu2 descriptor pool failed";
-                return false;
-            }
-            VkDescriptorSetAllocateInfo ai = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &layout,
-            };
-            return vkAllocateDescriptorSets(m_device, &ai, &set) == VK_SUCCESS;
-        };
-        if (!pool_and_set(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7, m_sync_layout, m_sync_pool, m_sync_set)
-            || !pool_and_set(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3, m_prefix_layout, m_prefix_pool, m_prefix_set))
-        {
-            error = "gpu2 descriptor set failed";
-            return false;
-        }
-        {
-            VkDescriptorPoolSize sizes[2] = {
-                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
-            };
-            VkDescriptorPoolCreateInfo info = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .maxSets = 1,
-                .poolSizeCount = 2,
-                .pPoolSizes = sizes,
-            };
-            if (vkCreateDescriptorPool(m_device, &info, nullptr, &m_idct_pool) != VK_SUCCESS)
-            {
-                error = "gpu2 idct descriptor pool failed";
-                return false;
-            }
-            VkDescriptorSetAllocateInfo ai = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = m_idct_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &m_idct_layout,
-            };
-            if (vkAllocateDescriptorSets(m_device, &ai, &m_idct_set) != VK_SUCCESS)
-            {
-                error = "gpu2 idct descriptor set failed";
-                return false;
-            }
-        }
-
-        auto buf_info = [](VkBuffer buffer) {
-            VkDescriptorBufferInfo info = { buffer, 0, VK_WHOLE_SIZE };
-            return info;
-        };
-        VkDescriptorBufferInfo sync_infos[7] = {
-            buf_info(m_bits_dev.buffer),
-            buf_info(m_chunks.buffer),
-            buf_info(m_tables.buffer),
-            buf_info(m_coeffs.buffer),
-            buf_info(m_state.buffer),
-            buf_info(m_entry.buffer),
-            buf_info(m_cps.buffer),
-        };
-        VkWriteDescriptorSet sync_writes[7] = {};
-        for (uint32_t i = 0; i < 7; ++i)
-        {
-            sync_writes[i] = {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = m_sync_set,
-                .dstBinding = i,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &sync_infos[i],
-            };
-        }
-        vkUpdateDescriptorSets(m_device, 7, sync_writes, 0, nullptr);
-
-        VkDescriptorBufferInfo prefix_infos[3] = {
-            buf_info(m_segs.buffer),
-            buf_info(m_state.buffer),
-            buf_info(m_entry.buffer),
-        };
-        VkWriteDescriptorSet prefix_writes[3] = {};
-        for (uint32_t i = 0; i < 3; ++i)
-        {
-            prefix_writes[i] = {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = m_prefix_set,
-                .dstBinding = i,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &prefix_infos[i],
-            };
-        }
-        vkUpdateDescriptorSets(m_device, 3, prefix_writes, 0, nullptr);
-
-        VkDescriptorImageInfo img_info = {
-            .sampler = VK_NULL_HANDLE,
-            .imageView = texture.view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        VkDescriptorBufferInfo coeff_info = buf_info(m_coeffs.buffer);
-        VkDescriptorBufferInfo qt_info = buf_info(m_qt.buffer);
-        VkWriteDescriptorSet idct_writes[3] = {};
-        idct_writes[0] = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_idct_set,
-            .dstBinding = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &img_info,
-        };
-        idct_writes[1] = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_idct_set,
-            .dstBinding = 1,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &coeff_info,
-        };
-        idct_writes[2] = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_idct_set,
-            .dstBinding = 2,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &qt_info,
-        };
-        vkUpdateDescriptorSets(m_device, 3, idct_writes, 0, nullptr);
-
-        compile_us = nowUs() - t_compile;
-        compile_last_us = compile_us;
-        m_pipeline = true;
-    }
-
-    std::memcpy(m_chunks.mapped, chunk_host.data(), chunk_host.size() * sizeof(ChunkGpu));
-    allocator.flush(m_chunks.allocation, 0, chunk_host.size() * sizeof(ChunkGpu));
-    std::memcpy(m_segs.mapped, seg_host.data(), seg_host.size() * sizeof(SegInfoGpu));
-    allocator.flush(m_segs.allocation, 0, seg_host.size() * sizeof(SegInfoGpu));
-
-    SyncPush push = {};
-    push.nchunks = int(chunk_host.size());
-    push.rounds = kSyncRounds;
-    push.blocks = stream.blocks_in_mcu;
-    for (int b = 0; b < stream.blocks_in_mcu; ++b)
-    {
-        const auto& block = stream.block[b];
-        push.pack[b] = std::uint32_t(block.dc)
-            | (std::uint32_t(4 + block.ac) << 8)
-            | (std::uint32_t(block.component) << 16);
-    }
 
     mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
     const mango::image::jpeg::JpegInfo& info = info_decoder.info();
-    IdctPush idct = {};
-    idct.width = info.width;
-    idct.height = info.height;
-    idct.xmcu = info.xmcu;
-    idct.mcu_y0 = 0;
-    idct.mcu_rows = info.ymcu;
-    idct.xblock = info.xblock;
-    idct.yblock = info.yblock;
-    idct.blocks_in_mcu = info.blocks_in_mcu;
-    idct.components = info.components;
+    Push push = {};
+    push.nch = chunks;
+    push.rounds = kSyncRounds;
+    push.bpm = stream.blocks_in_mcu;
+    push.dc_pack = m_dc_pack;
+    push.ac_pack = m_ac_pack;
+    push.comp_pack = m_comp_pack;
+    push.nwords = m_nwords;
+    push.width = info.width;
+    push.height = info.height;
+    push.xmcu = info.xmcu;
+    push.xblock = info.xblock;
+    push.yblock = info.yblock;
+    push.components = info.components;
     int off = 0;
     auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
     {
@@ -1741,58 +1390,95 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
         o = off;
         off += hsf * vsf;
     };
-    setComp(0, idct.y_hsf, idct.y_vsf, idct.y_qt, idct.y_off);
-    setComp(1, idct.cb_hsf, idct.cb_vsf, idct.cb_qt, idct.cb_off);
-    setComp(2, idct.cr_hsf, idct.cr_vsf, idct.cr_qt, idct.cr_off);
-    const int slots = 32;
-    idct.mcus_per_group = std::max(slots / bpm, 1);
+    setComp(0, push.y_hsf, push.y_vsf, push.y_qt, push.y_off);
+    setComp(1, push.cb_hsf, push.cb_vsf, push.cb_qt, push.cb_off);
+    setComp(2, push.cr_hsf, push.cr_vsf, push.cr_qt, push.cr_off);
+    push.mcus_per_group = std::max(32 / std::max(push.bpm, 1), 1);
+    push.nmcu = info.xmcu * info.ymcu;
 
-    vkResetCommandBuffer(m_cmd, 0);
+    VkCommandBuffer cmd = m_cmd;
+    vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    vkBeginCommandBuffer(m_cmd, &begin);
-
-    memBarrier(m_cmd, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    VkBufferCopy region = { 0, 0, m_bit_bytes };
-    vkCmdCopyBuffer(m_cmd, m_bits.buffer, m_bits_dev.buffer, 1, &region);
-    memBarrier(m_cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    vkCmdFillBuffer(m_cmd, m_coeffs.buffer, 0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(m_cmd, m_cps.buffer, 0, VK_WHOLE_SIZE, 0xffffffffu);
-    memBarrier(m_cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-    const uint32_t groups = (uint32_t(chunk_host.size()) + 127u) / 128u;
-    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sync_pipe);
-    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sync_pipe_layout,
-        0, 1, &m_sync_set, 0, nullptr);
-    for (int pass = 0; pass < kSyncPasses; ++pass)
+    vkBeginCommandBuffer(cmd, &begin);
+    if (m_queries)
     {
-        push.pass = pass;
-        push.doWrite = 0;
-        vkCmdPushConstants(m_cmd, m_sync_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(m_cmd, groups, 1, 1);
-        memBarrier(m_cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdResetQueryPool(cmd, m_queries, 0, 8);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_queries, 0);
     }
 
-    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_prefix_pipe);
-    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_prefix_pipe_layout,
-        0, 1, &m_prefix_set, 0, nullptr);
-    vkCmdDispatch(m_cmd, uint32_t(seg_host.size()), 1, 1);
-    memBarrier(m_cmd, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    memBarrier(cmd, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    auto copy = [&](const mango::vulkan::BufferAllocation& src, const mango::vulkan::BufferAllocation& dst, VkDeviceSize size)
+    {
+        VkBufferCopy region = { 0, 0, size };
+        vkCmdCopyBuffer(cmd, src.buffer, dst.buffer, 1, &region);
+    };
+    copy(m_bits, m_bits_dev, VkDeviceSize(m_nwords) * 4);
+    if (!m_static_copied)
+    {
+        copy(m_chunks_host, m_chunks, VkDeviceSize(chunks) * sizeof(ChunkGpu));
+        copy(m_segs_host, m_segs, VkDeviceSize(m_nsegs) * sizeof(SegGpu));
+        copy(m_tables_host, m_tables, sizeof(TablesGpu));
+        copy(m_qt_host, m_qt, sizeof(std::int32_t) * 256);
+        copy(m_seg_start_host, m_seg_start, VkDeviceSize(m_seg_start_words) * 4);
+        m_static_copied = true;
+    }
+    vkCmdFillBuffer(cmd, m_coef.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, m_dcd.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(cmd, m_flags.buffer, 0, VK_WHOLE_SIZE, 0);
+    memBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    auto stamp = [&](VkPipelineStageFlagBits stage, std::uint32_t index)
+    {
+        if (m_queries)
+            vkCmdWriteTimestamp(cmd, stage, m_queries, index);
+    };
+    stamp(VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
 
-    push.doWrite = 1;
-    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sync_pipe);
-    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sync_pipe_layout,
-        0, 1, &m_sync_set, 0, nullptr);
-    vkCmdPushConstants(m_cmd, m_sync_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(m_cmd, groups, 1, 1);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe_layout, 0, 1, &m_set, 0, nullptr);
+    auto dispatch = [&](Pipe pipe, std::uint32_t groups)
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipes[pipe]);
+        vkCmdPushConstants(cmd, m_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, std::max(groups, 1u), 1, 1);
+    };
 
+    const std::uint32_t sync_groups = (std::uint32_t(chunks) + 127u) / 128u;
+    for (int pass = 0; pass < kMaxPasses; ++pass)
+    {
+        push.pass = pass;
+        dispatch(PipeSync, sync_groups);
+        computeBarrier(cmd);
+    }
+    stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 2);
+    dispatch(PipePrefix, std::uint32_t(m_nsegs));
+    computeBarrier(cmd);
+    stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 3);
+    dispatch(PipeWrite, (std::uint32_t(chunks) * kPieces + 127u) / 128u);
+    computeBarrier(cmd);
+    stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 4);
+    {
+        const std::uint32_t dc_groups = (std::uint32_t(push.nmcu) + kDcTile - 1u) / kDcTile;
+        push.pass = 0;
+        dispatch(PipeDcLocal, dc_groups);
+        computeBarrier(cmd);
+        const std::int32_t nch = push.nch;
+        push.nch = std::int32_t(dc_groups);
+        dispatch(PipeDcGroups, 1);
+        computeBarrier(cmd);
+        push.nch = nch;
+        push.pass = 1;
+        dispatch(PipeDcLocal, dc_groups);
+    }
+    stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 5);
+
+    if (m_linear)
+        computeBarrier(cmd);
+    else
+    {
     VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT;
     if (texture.layout != VK_IMAGE_LAYOUT_UNDEFINED && texture.layout != VK_IMAGE_LAYOUT_GENERAL)
@@ -1816,27 +1502,56 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
     };
-    vkCmdPipelineBarrier(m_cmd,
-        src_stage,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(cmd, src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &coeffs_ready, 0, nullptr, 1, &to_general);
     texture.layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
 
-    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_idct_pipe);
-    vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_idct_pipe_layout,
-        0, 1, &m_idct_set, 0, nullptr);
-    vkCmdPushConstants(m_cmd, m_idct_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(idct), &idct);
-    const uint32_t mcus = uint32_t(std::max(info.xmcu, 0)) * uint32_t(std::max(info.ymcu, 0));
-    const uint32_t idct_groups = (mcus + uint32_t(std::max(idct.mcus_per_group, 1)) - 1u)
-        / uint32_t(std::max(idct.mcus_per_group, 1));
-    vkCmdDispatch(m_cmd, std::max(idct_groups, 1u), 1, 1);
-    texture.recordPublishComputeStores(m_cmd);
-    vkEndCommandBuffer(m_cmd);
+    const std::uint32_t idct_groups = (std::uint32_t(push.nmcu) + std::uint32_t(push.mcus_per_group) - 1u)
+        / std::uint32_t(push.mcus_per_group);
+    dispatch(PipeIdct, idct_groups);
+    stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 6);
+    if (m_linear)
+        texture.recordPublishFromBuffer(cmd);
+    else
+        texture.recordPublishComputeStores(cmd);
+    stamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 7);
+    vkEndCommandBuffer(cmd);
 
     const mango::u64 t0 = nowUs();
-    if (!submitAndWait(m_queue, m_cmd, m_fence, m_device, 20ull * 1000ull * 1000ull * 1000ull, error))
+    vkResetFences(m_device, 1, &m_fence);
+    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(m_queue, 1, &submit, m_fence) != VK_SUCCESS)
+    {
+        error = "vkQueueSubmit failed";
         return false;
-    decode_us = nowUs() - t0;
+    }
+    const VkResult wr = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, 20ull * 1000ull * 1000ull * 1000ull);
+    if (wr != VK_SUCCESS)
+    {
+        error = wr == VK_TIMEOUT ? "gpu2 fence timed out" : "vkWaitForFences failed";
+        return false;
+    }
+    wall_us = nowUs() - t0;
+    decode_us = wall_us;
+
+    if (m_queries)
+    {
+        std::uint64_t ts[8] = {};
+        if (vkGetQueryPoolResults(m_device, m_queries, 0, 8, sizeof(ts), ts, sizeof(std::uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+        {
+            auto us = [&](int a, int b) { return mango::u64(double(ts[b] - ts[a]) * m_tick_ns / 1000.0); };
+            for (int i = 0; i < 6; ++i)
+                stage_us[i] = us(i, i + 1);
+            huffman_us = us(0, 5);
+            pixel_us = us(5, 6);
+            decode_us = huffman_us + pixel_us;
+            publish_us = us(6, 7);
+        }
+    }
     return true;
 }
 
