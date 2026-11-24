@@ -146,7 +146,7 @@ mango                     6.05ms    1.74ms    3.38ms    0.31ms    6.36ms  host->
 mango-hybrid              4.10ms    1.46ms    2.63ms    0.22ms    8.12ms  file->VkImage
 mango-gpu                 5.55ms    3.61ms    0.73ms    0.95ms    6.50ms  file->VkImage
 mango-gpu-index           8.49ms    6.78ms    5.80ms    0.25ms    8.74ms  file->VkImage
-mango-gpu2                1.79ms    0.87ms    0.00ms    1.76ms    3.54ms  file->VkImage
+mango-gpu2                1.34ms    1.21ms    0.00ms    3.19ms    4.53ms  file->VkImage
 wic                      33.33ms   29.83ms    3.50ms    0.30ms   33.63ms  host->VkImage
 turbojpeg                28.68ms   25.36ms    3.32ms    0.26ms   28.94ms  host->VkImage
 
@@ -157,7 +157,7 @@ mango                    27.39ms   18.56ms    5.28ms    4.93ms   32.32ms  host->
 mango-hybrid             16.79ms   16.03ms    0.76ms    0.37ms   40.54ms  file->VkImage
 mango-gpu               496.04ms  491.30ms    0.70ms    0.29ms  496.33ms  file->VkImage
 mango-gpu-index          27.92ms   23.12ms    0.52ms    0.73ms   28.65ms  file->VkImage
-mango-gpu2                3.28ms    2.31ms    0.00ms    0.48ms    3.76ms  file->VkImage
+mango-gpu2                1.49ms    1.34ms    0.00ms    2.17ms    3.66ms  file->VkImage
 wic                      32.37ms   27.12ms    5.24ms    0.28ms   32.65ms  host->VkImage
 turbojpeg                29.71ms   24.90ms    4.80ms    0.35ms   30.06ms  host->VkImage
 
