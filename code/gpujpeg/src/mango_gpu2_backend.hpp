@@ -55,6 +55,7 @@ private:
     bool m_pipeline = false;
     bool m_static_copied = false;
     bool m_linear = false;
+    bool m_direct = false;  // imageStore into the texture, no publish copy (GPU2_LINEAR=1 selects the buffer path)
     int m_ntables = 0;
     int m_sync_wg = 128;
     int m_write_wg = 128;  // IDCT writes the texture's publish buffer, then one copy into the image

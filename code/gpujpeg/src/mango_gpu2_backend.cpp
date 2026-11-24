@@ -1216,7 +1216,8 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
     std::string& error)
 {
     const mango::u64 t_compile = nowUs();
-    m_linear = bool(texture.publish_alloc);
+    m_linear = bool(texture.publish_alloc) && std::getenv("GPU2_LINEAR") != nullptr;
+    m_direct = !m_linear;
     if (const char* s = std::getenv("GPU2_SYNC_WG"))
         m_sync_wg = std::atoi(s);
     if (const char* s = std::getenv("GPU2_WRITE_WG"))
@@ -1568,6 +1569,24 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     stamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 6);
     if (m_linear)
         texture.recordPublishFromBuffer(cmd);
+    else if (m_direct)
+    {
+        VkImageMemoryBarrier to_read = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = texture.image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &to_read);
+        texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
     else
         texture.recordPublishComputeStores(cmd);
     stamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 7);
