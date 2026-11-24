@@ -2599,16 +2599,17 @@ int main(int argc, const char* argv[])
     std::string radv_gpu_note;
     if (physicalDeviceIsRadv(selected_device, radv_info))
     {
-        // Self-sync hands the cursor through shared memory. RADV miscompiles that,
-        // so the lanes never agree on a serial scan or a restart-split scan.
+        // The original self-sync path hands the cursor through shared memory.
+        // RADV miscompiles that, so those lanes never agree. mango-gpu2 is a
+        // separate path and stays enabled on RADV.
         const auto is_self_sync = [](const Job& job)
         {
-            return (job.use_gpu && job.gpu && !job.gpu->index_mode) || job.use_gpu2;
+            return job.use_gpu && job.gpu && !job.gpu->index_mode;
         };
         if (std::any_of(jobs.begin(), jobs.end(), is_self_sync))
         {
             radv_gpu_note = "NOTE: blacklisted (RADV driver shared memory bug: sync failure)";
-            printLine("self-sync: {} ({})", radv_gpu_note, radv_info);
+            printLine("mango-gpu: {} ({})", radv_gpu_note, radv_info);
             std::erase_if(jobs, is_self_sync);
         }
     }
