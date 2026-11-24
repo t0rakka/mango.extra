@@ -4,6 +4,7 @@
 
 #include "bench.hpp"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -14,6 +15,25 @@ namespace gpujpeg
 {
 
 struct DecodedTexture;
+
+// Push constants shared by every gpu2 pipeline; mirrors the GLSL block in kCommon.
+struct Gpu2Push
+{
+    std::int32_t nch;
+    std::int32_t pass;
+    std::int32_t rounds;
+    std::int32_t bpm;
+    std::uint32_t dc_pack;
+    std::uint32_t ac_pack;
+    std::uint32_t comp_pack;
+    std::uint32_t nwords;
+    std::int32_t width, height, xmcu, xblock, yblock, components;
+    std::int32_t y_hsf, y_vsf, y_qt, y_off;
+    std::int32_t cb_hsf, cb_vsf, cb_qt, cb_off;
+    std::int32_t cr_hsf, cr_vsf, cr_qt, cr_off;
+    std::int32_t mcus_per_group;
+    std::int32_t nmcu;
+};
 
 // Wide self-synchronising Huffman on Vulkan compute, then IDCT + YCbCr into
 // the VkImage. The host unstuffs the scan into big-endian words; chunks are
@@ -66,6 +86,8 @@ private:
     std::uint32_t m_ac_pack = 0;
     std::uint32_t m_comp_pack = 0;
     std::uint32_t m_seg_start_words = 0;
+    Gpu2Push m_push {};  // frame layout from extract, table packing from upload
+    std::array<std::int32_t, 4 * 64> m_natural_qt {};
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;

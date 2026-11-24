@@ -1309,11 +1309,14 @@ public:
                 r.error = "DecodedTexture missing for mango-gpu2";
                 return r;
             }
+            const bool first_upload = !job.gpu2->uploaded;
             if (!job.gpu2->upload(*allocator, error))
             {
                 r.error = error;
                 return r;
             }
+            if (first_upload)
+                printLine("  gpu2: upload {:.2f} ms (host unstuff, word swap, staging)", job.gpu2->upload_us / 1000.0);
             if (!job.gpu2->decode(*this, *allocator, texture, error))
             {
                 r.error = error;
@@ -2250,10 +2253,11 @@ int main(int argc, const char* argv[])
         }
         else
         {
-            printLine("mango-gpu2: {} segments, packed {:.1f} KB, {}x{} MCU",
+            printLine("mango-gpu2: {} segments, packed {:.1f} KB, {}x{} MCU, extract {:.2f} ms",
                 gpu2->stream.segments.size(),
                 gpu2->stream.packed_bytes / 1024.0,
-                gpu2->stream.xmcu, gpu2->stream.ymcu);
+                gpu2->stream.xmcu, gpu2->stream.ymcu,
+                gpu2->extract_us / 1000.0);
             Job job;
             job.name = "mango-gpu2";
             job.use_gpu2 = true;

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,23 +60,7 @@ struct TablesGpu
     std::uint32_t hv[8 * 256 / 4];
 };
 
-struct Push
-{
-    std::int32_t nch;
-    std::int32_t pass;
-    std::int32_t rounds;
-    std::int32_t bpm;
-    std::uint32_t dc_pack;
-    std::uint32_t ac_pack;
-    std::uint32_t comp_pack;
-    std::uint32_t nwords;
-    std::int32_t width, height, xmcu, xblock, yblock, components;
-    std::int32_t y_hsf, y_vsf, y_qt, y_off;
-    std::int32_t cb_hsf, cb_vsf, cb_qt, cb_off;
-    std::int32_t cr_hsf, cr_vsf, cr_qt, cr_off;
-    std::int32_t mcus_per_group;
-    std::int32_t nmcu;
-};
+using Push = Gpu2Push;
 static_assert(sizeof(Push) <= 128, "push constants");
 
 constexpr char kCommon[] = R"glsl(
@@ -879,6 +864,38 @@ void computeBarrier(VkCommandBuffer cmd)
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
+void fillLayout(const mango::image::jpeg::JpegInfo& info, int bpm, Push& push)
+{
+    push.bpm = bpm;
+    push.width = info.width;
+    push.height = info.height;
+    push.xmcu = info.xmcu;
+    push.xblock = info.xblock;
+    push.yblock = info.yblock;
+    push.components = info.components;
+    int off = 0;
+    auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
+    {
+        if (idx >= info.components)
+        {
+            hsf = vsf = 1;
+            qt = 0;
+            o = 0;
+            return;
+        }
+        hsf = info.component[idx].hsf;
+        vsf = info.component[idx].vsf;
+        qt = info.component[idx].qt;
+        o = off;
+        off += hsf * vsf;
+    };
+    setComp(0, push.y_hsf, push.y_vsf, push.y_qt, push.y_off);
+    setComp(1, push.cb_hsf, push.cb_vsf, push.cb_qt, push.cb_off);
+    setComp(2, push.cr_hsf, push.cr_vsf, push.cr_qt, push.cr_off);
+    push.mcus_per_group = std::max(32 / std::max(push.bpm, 1), 1);
+    push.nmcu = info.xmcu * info.ymcu;
+}
+
 } // namespace
 
 bool MangoGpu2Decoder::extract(mango::ConstMemory jpeg, std::string& error)
@@ -893,12 +910,25 @@ bool MangoGpu2Decoder::extract(mango::ConstMemory jpeg, std::string& error)
     const mango::u64 t0 = nowUs();
     mango::image::jpeg::JpegDecoder decoder(jpeg);
     stream = decoder.extractEntropy();
-    extract_us = nowUs() - t0;
     if (!stream.ok)
     {
         error = stream.error.empty() ? "extractEntropy failed" : stream.error;
         return false;
     }
+
+    const mango::image::jpeg::JpegInfo& info = decoder.info();
+    m_natural_qt.fill(0);
+    for (int t = 0; t < 4; ++t)
+    {
+        if (!info.quant[t])
+            continue;
+        for (int i = 0; i < 64; ++i)
+            m_natural_qt[t * 64 + i] = info.quant[t][i];
+    }
+    m_push = {};
+    fillLayout(info, stream.blocks_in_mcu, m_push);
+    extract_us = nowUs() - t0;
+
     if (stream.packed_bytes == 0 || stream.segments.empty())
     {
         error = "entropy stream is empty";
@@ -925,8 +955,12 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     const mango::u64 t0 = nowUs();
     const int bpm = stream.blocks_in_mcu;
 
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(stream.packed_bytes + 64);
+    size_t stuffed = 0;
+    for (const auto& seg : stream.segments)
+        stuffed += seg.bytes.size;
+    const size_t capacity = ((stuffed + 3u) & ~size_t(3)) + 32u;
+    std::unique_ptr<std::uint8_t[]> bytes(new std::uint8_t[capacity]);
+    size_t nunstuffed = 0;
     std::vector<ChunkGpu> chunk_host;
     std::vector<SegGpu> seg_host;
     std::uint32_t bit = 0;
@@ -936,19 +970,21 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     {
         const std::uint32_t seg_bit = bit;
         const std::uint8_t* p = seg.bytes.address;
-        bool ff = false;
-        for (size_t i = 0; i < seg.bytes.size; ++i)
+        const std::uint8_t* end = p + seg.bytes.size;
+        std::uint8_t* out = bytes.get() + nunstuffed;
+        while (p < end)
         {
-            const std::uint8_t b = p[i];
-            if (ff && b == 0)
-            {
-                ff = false;
-                continue;
-            }
-            ff = b == 0xff;
-            bytes.push_back(b);
-            bit += 8;
+            // Copy up to and including the next 0xFF, then drop the stuffed zero after it.
+            const void* ff = std::memchr(p, 0xff, size_t(end - p));
+            const size_t run = ff ? size_t(static_cast<const std::uint8_t*>(ff) - p) + 1 : size_t(end - p);
+            std::memcpy(out, p, run);
+            out += run;
+            p += run;
+            if (ff && p < end && *p == 0)
+                ++p;
         }
+        nunstuffed = size_t(out - bytes.get());
+        bit = std::uint32_t(nunstuffed * 8);
         const std::uint32_t seg_end = bit;
         SegGpu sg = {};
         sg.chunk0 = int(chunk_host.size());
@@ -980,8 +1016,8 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     m_nblk = block;
     m_nsegs = int(seg_host.size());
 
-    const size_t nbytes = ((bytes.size() + 3u) & ~size_t(3)) + 32u;
-    bytes.resize(nbytes, 0);
+    const size_t nbytes = ((nunstuffed + 3u) & ~size_t(3)) + 32u;
+    std::memset(bytes.get() + nunstuffed, 0, nbytes - nunstuffed);
     m_nwords = std::uint32_t(nbytes / 4);
 
     TablesGpu tab = {};
@@ -1028,18 +1064,11 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
         m_comp_pack |= std::uint32_t(info.component & 3) << (2 * b);
     }
 
-    std::int32_t natural_qt[4 * 64] = {};
-    {
-        mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
-        const mango::image::jpeg::JpegInfo& info = info_decoder.info();
-        for (int t = 0; t < 4; ++t)
-        {
-            if (!info.quant[t])
-                continue;
-            for (int i = 0; i < 64; ++i)
-                natural_qt[t * 64 + i] = info.quant[t][i];
-        }
-    }
+    m_push.nch = int(chunk_host.size());
+    m_push.dc_pack = m_dc_pack;
+    m_push.ac_pack = m_ac_pack;
+    m_push.comp_pack = m_comp_pack;
+    m_push.nwords = m_nwords;
 
     using mango::vulkan::MemoryUsage;
     auto staging = [&](mango::vulkan::BufferAllocation& buf, const void* src, size_t size) -> bool
@@ -1061,10 +1090,10 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
     };
 
     // The bitstream goes word-swapped so the shader reads big-endian words directly.
-    std::vector<std::uint32_t> words(m_nwords);
+    std::unique_ptr<std::uint32_t[]> words(new std::uint32_t[m_nwords]);
     for (std::uint32_t i = 0; i < m_nwords; ++i)
     {
-        const std::uint8_t* b = bytes.data() + i * 4;
+        const std::uint8_t* b = bytes.get() + size_t(i) * 4;
         words[i] = (std::uint32_t(b[0]) << 24) | (std::uint32_t(b[1]) << 16)
             | (std::uint32_t(b[2]) << 8) | std::uint32_t(b[3]);
     }
@@ -1080,16 +1109,16 @@ bool MangoGpu2Decoder::upload(mango::vulkan::Allocator& allocator, std::string& 
             seg_start[size_t(sg.mcu0) >> 5] |= 1u << (sg.mcu0 & 31);
     }
     const bool ok =
-        staging(m_bits, words.data(), words.size() * 4)
+        staging(m_bits, words.get(), size_t(m_nwords) * 4)
         && staging(m_chunks_host, chunk_host.data(), nch * sizeof(ChunkGpu))
         && staging(m_segs_host, seg_host.data(), seg_host.size() * sizeof(SegGpu))
         && staging(m_tables_host, &tab, sizeof(tab))
-        && staging(m_qt_host, natural_qt, sizeof(natural_qt))
-        && device(m_bits_dev, words.size() * 4, true)
+        && staging(m_qt_host, m_natural_qt.data(), sizeof(m_natural_qt))
+        && device(m_bits_dev, size_t(m_nwords) * 4, true)
         && device(m_chunks, nch * sizeof(ChunkGpu), true)
         && device(m_segs, seg_host.size() * sizeof(SegGpu), true)
         && device(m_tables, sizeof(tab), true)
-        && device(m_qt, sizeof(natural_qt), true)
+        && device(m_qt, sizeof(m_natural_qt), true)
         && device(m_st_in, nch * 8, false)
         && device(m_st_out, nch * 8, false)
         && device(m_cnt, nch * 4, false)
@@ -1170,38 +1199,6 @@ void MangoGpu2Decoder::release(mango::vulkan::Allocator& allocator)
     uploaded = false;
 }
 
-static void fillLayout(const mango::image::jpeg::JpegInfo& info, int bpm, Push& push)
-{
-    push.bpm = bpm;
-    push.width = info.width;
-    push.height = info.height;
-    push.xmcu = info.xmcu;
-    push.xblock = info.xblock;
-    push.yblock = info.yblock;
-    push.components = info.components;
-    int off = 0;
-    auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
-    {
-        if (idx >= info.components)
-        {
-            hsf = vsf = 1;
-            qt = 0;
-            o = 0;
-            return;
-        }
-        hsf = info.component[idx].hsf;
-        vsf = info.component[idx].vsf;
-        qt = info.component[idx].qt;
-        o = off;
-        off += hsf * vsf;
-    };
-    setComp(0, push.y_hsf, push.y_vsf, push.y_qt, push.y_off);
-    setComp(1, push.cb_hsf, push.cb_vsf, push.cb_qt, push.cb_off);
-    setComp(2, push.cr_hsf, push.cr_vsf, push.cr_qt, push.cr_off);
-    push.mcus_per_group = std::max(32 / std::max(push.bpm, 1), 1);
-    push.nmcu = info.xmcu * info.ymcu;
-}
-
 static std::string idctDefines(const Push& p)
 {
     auto d = [](const char* name, int v) { return std::string("#define ") + name + " " + std::to_string(v) + "\n"; };
@@ -1222,11 +1219,7 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
         m_sync_wg = std::atoi(s);
     if (const char* s = std::getenv("GPU2_WRITE_WG"))
         m_write_wg = std::atoi(s);
-    Push layout = {};
-    {
-        mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
-        fillLayout(info_decoder.info(), stream.blocks_in_mcu, layout);
-    }
+    const Push& layout = m_push;
     const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n";
     mango::vulkan::Compiler compiler;
     // The shared Huffman code sits before each main's local_size declaration,
@@ -1441,16 +1434,8 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     if (!m_pipeline && !createPipelines(window, texture, error))
         return false;
 
-    mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
-    const mango::image::jpeg::JpegInfo& info = info_decoder.info();
-    Push push = {};
-    push.nch = chunks;
+    Push push = m_push;
     push.rounds = m_sync_wg;
-    push.dc_pack = m_dc_pack;
-    push.ac_pack = m_ac_pack;
-    push.comp_pack = m_comp_pack;
-    push.nwords = m_nwords;
-    fillLayout(info, stream.blocks_in_mcu, push);
 
     VkCommandBuffer cmd = m_cmd;
     vkResetCommandBuffer(cmd, 0);
