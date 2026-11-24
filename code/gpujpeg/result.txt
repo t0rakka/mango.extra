@@ -42,28 +42,28 @@ GPU: nVidia RTX 4070
 file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    10.75ms    3.82ms    6.04ms    0.66ms   11.41ms  host->VkImage
-mango-hybrid             25.72ms    2.46ms   23.26ms    0.36ms   34.61ms  file->VkImage
-mango-gpu                10.70ms    5.25ms    3.80ms    0.60ms   11.30ms  file->VkImage
-mango-gpu-index          16.86ms    8.75ms    7.99ms    0.41ms   17.27ms  file->VkImage
-mango-gpu2               TODO
-nvjpeg-hybrid            12.18ms   10.72ms    1.45ms    0.40ms   12.58ms  file->VkImage
-nvjpeg-gpu               12.14ms   10.65ms    1.49ms    5.39ms   17.54ms  file->VkImage
-wic                      43.25ms   37.14ms    6.10ms    0.56ms   43.81ms  host->VkImage
-turbojpeg                35.68ms   29.57ms    6.11ms    0.59ms   36.28ms  host->VkImage
+mango                    10.68ms    3.67ms    6.12ms    0.54ms   11.22ms  host->VkImage
+mango-hybrid             40.91ms    2.22ms   38.69ms    0.46ms   48.66ms  file->VkImage
+mango-gpu                10.67ms    5.43ms    3.83ms    0.34ms   11.01ms  file->VkImage
+mango-gpu-index          32.34ms    8.48ms    9.58ms    0.45ms   32.79ms  file->VkImage
+mango-gpu2                3.63ms    1.60ms    0.00ms    2.92ms    6.55ms  file->VkImage
+nvjpeg-hybrid            12.53ms   11.04ms    1.49ms    0.43ms   12.96ms  file->VkImage
+nvjpeg-gpu               12.41ms   10.90ms    1.51ms    0.41ms   12.83ms  file->VkImage
+wic                      41.11ms   34.97ms    6.12ms    0.39ms   41.51ms  host->VkImage
+turbojpeg                36.30ms   30.22ms    6.08ms    0.40ms   36.71ms  host->VkImage
 
 file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    40.99ms   33.97ms    6.06ms    0.39ms   41.38ms  host->VkImage
-mango-hybrid             32.58ms   29.66ms    2.91ms    0.29ms   36.92ms  file->VkImage
-mango-gpu               381.96ms  377.78ms    2.90ms    0.20ms  382.16ms  file->VkImage
-mango-gpu-index          36.84ms   26.07ms    1.79ms    0.45ms   37.30ms  file->VkImage
-mango-gpu2               TODO
-nvjpeg-hybrid            12.08ms   10.71ms    1.37ms    0.39ms   12.47ms  file->VkImage
-nvjpeg-gpu               12.14ms   10.92ms    1.22ms   21.17ms   33.31ms  file->VkImage
-wic                      48.62ms   41.88ms    6.73ms    0.50ms   49.12ms  host->VkImage
-turbojpeg                34.60ms   28.82ms    5.77ms    0.64ms   35.25ms  host->VkImage
+mango                    31.40ms   24.41ms    6.09ms    0.40ms   31.80ms  host->VkImage
+mango-hybrid             42.40ms   20.51ms   21.89ms    0.43ms   49.81ms  file->VkImage
+mango-gpu               384.07ms  380.28ms    2.51ms    0.27ms  384.34ms  file->VkImage
+mango-gpu-index          49.25ms   26.10ms    1.80ms    0.43ms   49.68ms  file->VkImage
+mango-gpu2                3.41ms    1.41ms    0.00ms    3.65ms    7.06ms  file->VkImage
+nvjpeg-hybrid            12.12ms   10.80ms    1.32ms    0.41ms   12.54ms  file->VkImage
+nvjpeg-gpu               12.42ms   11.02ms    1.40ms    0.43ms   12.85ms  file->VkImage
+wic                      40.42ms   34.14ms    6.26ms    0.42ms   40.84ms  host->VkImage
+turbojpeg                34.75ms   28.59ms    6.15ms    0.44ms   35.19ms  host->VkImage
 
 ---------------------------------------------------------------------------------------------------------
 OS: Windows 11
