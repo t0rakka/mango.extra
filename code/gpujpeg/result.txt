@@ -10,24 +10,26 @@ GPU: nVidia GTX 2080ti
 file: rst.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    37.24ms    4.97ms   11.86ms    7.25ms   44.50ms  host->VkImage
-mango-hybrid             13.98ms    2.86ms   11.12ms    0.43ms  117.31ms  file->VkImage
-mango-gpu                16.85ms    7.17ms    5.31ms    0.40ms   17.25ms  file->VkImage
-mango-gpu-index          25.59ms   14.61ms   15.50ms    0.61ms   26.20ms  file->VkImage
-nvjpeg-hybrid            58.53ms   41.78ms   16.75ms    0.40ms   58.94ms  file->VkImage
-nvjpeg-gpu               44.06ms   40.86ms    3.20ms    0.42ms   44.49ms  file->VkImage
-turbojpeg                55.70ms   44.71ms   10.99ms    0.41ms   56.11ms  host->VkImage
+mango                    14.83ms    3.44ms   10.30ms    0.33ms   15.16ms  host->VkImage
+mango-hybrid             11.30ms    2.58ms    8.72ms    0.46ms  154.87ms  file->VkImage
+mango-gpu                 8.94ms    4.49ms    3.10ms    0.48ms    9.43ms  file->VkImage
+mango-gpu-index          16.67ms   12.77ms   12.54ms    0.42ms   17.09ms  file->VkImage
+mango-gpu2                4.12ms    1.98ms    0.00ms    1.02ms    5.14ms  file->VkImage
+nvjpeg-hybrid            44.39ms   42.35ms    2.04ms    0.47ms   44.86ms  file->VkImage
+nvjpeg-gpu               44.70ms   42.67ms    2.02ms    0.48ms   45.17ms  file->VkImage
+turbojpeg                55.89ms   46.48ms    9.41ms    0.50ms   56.39ms  host->VkImage
 
 file: serial.jpg (3888 x 2592)
 backend                    READY    decode   promote   present       e2e  path
 
-mango                    68.34ms   36.14ms   12.06ms    7.54ms   75.88ms  host->VkImage
-mango-hybrid             28.65ms   25.27ms    3.38ms    0.47ms  124.41ms  file->VkImage
-mango-gpu               542.36ms  532.64ms    2.90ms    0.61ms  542.96ms  file->VkImage
-mango-gpu-index          40.12ms   31.77ms    2.11ms    0.68ms   40.80ms  file->VkImage
-nvjpeg-hybrid            44.35ms   40.05ms    4.30ms    0.50ms   44.85ms  file->VkImage
-nvjpeg-gpu               44.15ms   41.76ms    2.39ms    0.47ms   44.62ms  file->VkImage
-turbojpeg                50.84ms   40.03ms   10.80ms    0.48ms   51.32ms  host->VkImage
+mango                    47.60ms   36.44ms   10.09ms    0.39ms   48.00ms  host->VkImage
+mango-hybrid             29.02ms   26.60ms    2.43ms    0.51ms  170.67ms  file->VkImage
+mango-gpu               478.01ms  472.71ms    3.34ms    0.58ms  478.60ms  file->VkImage
+mango-gpu-index          35.61ms   32.38ms    2.10ms    0.46ms   36.07ms  file->VkImage
+mango-gpu2                4.38ms    1.98ms    0.00ms    0.72ms    5.11ms  file->VkImage
+nvjpeg-hybrid            42.42ms   40.36ms    2.06ms    0.48ms   42.90ms  file->VkImage
+nvjpeg-gpu               43.20ms   41.10ms    2.10ms    0.47ms   43.67ms  file->VkImage
+turbojpeg                50.80ms   41.35ms    9.45ms    0.48ms   51.28ms  host->VkImage
 
 ---------------------------------------------------------------------------------------------------------
 OS: Windows 11
@@ -44,6 +46,7 @@ mango                    10.75ms    3.82ms    6.04ms    0.66ms   11.41ms  host->
 mango-hybrid             25.72ms    2.46ms   23.26ms    0.36ms   34.61ms  file->VkImage
 mango-gpu                10.70ms    5.25ms    3.80ms    0.60ms   11.30ms  file->VkImage
 mango-gpu-index          16.86ms    8.75ms    7.99ms    0.41ms   17.27ms  file->VkImage
+mango-gpu2               TODO
 nvjpeg-hybrid            12.18ms   10.72ms    1.45ms    0.40ms   12.58ms  file->VkImage
 nvjpeg-gpu               12.14ms   10.65ms    1.49ms    5.39ms   17.54ms  file->VkImage
 wic                      43.25ms   37.14ms    6.10ms    0.56ms   43.81ms  host->VkImage
@@ -56,6 +59,7 @@ mango                    40.99ms   33.97ms    6.06ms    0.39ms   41.38ms  host->
 mango-hybrid             32.58ms   29.66ms    2.91ms    0.29ms   36.92ms  file->VkImage
 mango-gpu               381.96ms  377.78ms    2.90ms    0.20ms  382.16ms  file->VkImage
 mango-gpu-index          36.84ms   26.07ms    1.79ms    0.45ms   37.30ms  file->VkImage
+mango-gpu2               TODO
 nvjpeg-hybrid            12.08ms   10.71ms    1.37ms    0.39ms   12.47ms  file->VkImage
 nvjpeg-gpu               12.14ms   10.92ms    1.22ms   21.17ms   33.31ms  file->VkImage
 wic                      48.62ms   41.88ms    6.73ms    0.50ms   49.12ms  host->VkImage
@@ -76,6 +80,7 @@ mango                    14.32ms    2.33ms    3.88ms    2.85ms   17.18ms  host->
 mango-hybrid              7.71ms    1.58ms    6.13ms    0.40ms   20.72ms  file->VkImage
 mango-gpu                 9.06ms    3.09ms    1.82ms    0.23ms    9.30ms  file->VkImage
 mango-gpu-index          14.00ms    6.29ms    6.84ms    0.38ms   14.38ms  file->VkImage
+mango-gpu2               TODO
 nvjpeg-hybrid            11.37ms    9.19ms    2.18ms    0.19ms   11.56ms  file->VkImage
 nvjpeg-gpu               10.06ms    9.05ms    1.01ms    0.17ms   10.23ms  file->VkImage
 intel-vpl               506.61ms  500.88ms    5.71ms    0.39ms  507.00ms  igpu->VkImage
@@ -89,6 +94,7 @@ mango                    32.99ms   21.38ms    4.37ms    2.63ms   35.63ms  host->
 mango-hybrid             20.04ms   18.08ms    1.96ms    0.38ms   31.97ms  file->VkImage
 mango-gpu               365.02ms  358.87ms    1.81ms    0.41ms  365.42ms  file->VkImage
 mango-gpu-index          31.66ms   24.89ms    1.59ms    0.28ms   31.94ms  file->VkImage
+mango-gpu2               TODO
 nvjpeg-hybrid            11.42ms    9.24ms    2.18ms    0.18ms   11.61ms  file->VkImage
 nvjpeg-gpu               10.00ms    9.06ms    0.94ms    0.17ms   10.17ms  file->VkImage
 intel-vpl               156.35ms  151.29ms    5.05ms    0.35ms  156.70ms  igpu->VkImage
@@ -110,6 +116,7 @@ mango                    11.37ms    2.43ms    6.41ms    0.82ms   12.18ms  host->
 mango-hybrid              7.30ms    1.90ms    5.40ms    0.17ms   13.44ms  file->VkImage
 mango-gpu               NOTE: blacklisted (RADV driver shared memory bug: sync failure)
 mango-gpu-index          24.67ms   17.10ms   16.75ms    0.12ms   24.80ms  file->VkImage
+mango-gpu2               TODO
 roc-hardware             70.78ms   68.44ms    2.34ms    0.10ms   70.89ms  file->VkImage
 turbojpeg                30.31ms   24.74ms    5.57ms    0.10ms   30.41ms  host->VkImage
 
@@ -120,6 +127,7 @@ mango                    35.48ms   26.93ms    6.30ms    0.91ms   36.40ms  host->
 mango-hybrid             22.69ms   22.12ms    0.57ms    0.18ms   33.59ms  file->VkImage
 mango-gpu               NOTE: blacklisted (RADV driver shared memory bug: sync failure)
 mango-gpu-index          29.66ms   21.53ms    1.16ms    0.12ms   29.77ms  file->VkImage
+mango-gpu2               TODO
 roc-hardware             66.56ms   64.33ms    2.23ms    0.12ms   66.69ms  file->VkImage
 turbojpeg                29.88ms   24.11ms    5.76ms    0.12ms   29.99ms  host->VkImage
 
@@ -138,6 +146,7 @@ mango                    12.01ms    2.60ms    5.70ms    5.03ms   17.05ms  host->
 mango-hybrid              6.28ms    1.32ms    4.96ms    0.46ms   33.12ms  file->VkImage
 mango-gpu                 9.44ms    5.21ms    0.77ms    0.25ms    9.69ms  file->VkImage
 mango-gpu-index          13.59ms    8.60ms    8.02ms    0.50ms   14.09ms  file->VkImage
+mango-gpu2               TODO
 wic                      34.78ms   30.14ms    4.63ms    0.26ms   35.04ms  host->VkImage
 turbojpeg                29.58ms   25.22ms    4.36ms    0.24ms   29.82ms  host->VkImage
 
@@ -148,6 +157,7 @@ mango                    27.39ms   18.56ms    5.28ms    4.93ms   32.32ms  host->
 mango-hybrid             16.79ms   16.03ms    0.76ms    0.37ms   40.54ms  file->VkImage
 mango-gpu               496.04ms  491.30ms    0.70ms    0.29ms  496.33ms  file->VkImage
 mango-gpu-index          27.92ms   23.12ms    0.52ms    0.73ms   28.65ms  file->VkImage
+mango-gpu2               TODO
 wic                      32.37ms   27.12ms    5.24ms    0.28ms   32.65ms  host->VkImage
 turbojpeg                29.71ms   24.90ms    4.80ms    0.35ms   30.06ms  host->VkImage
 
@@ -166,6 +176,7 @@ mango                    25.65ms    3.34ms   21.22ms    8.55ms   34.21ms  host->
 mango-hybrid             13.57ms    2.55ms   11.02ms    1.62ms   18.63ms  file->VkImage
 mango-gpu                 9.50ms    5.63ms    1.83ms    0.55ms   10.05ms  file->VkImage
 mango-gpu-index          12.17ms    8.52ms    7.33ms    0.50ms   12.67ms  file->VkImage
+mango-gpu2               TODO
 turbojpeg                30.27ms   26.72ms    3.54ms    1.20ms   31.47ms  host->VkImage
 apple-vt [hw]            11.91ms   11.83ms    0.08ms    1.03ms   12.96ms  file->VkImage
 apple-imageio            26.27ms   26.18ms    0.09ms    1.31ms   27.61ms  file->VkImage
@@ -177,6 +188,7 @@ mango                    44.18ms   20.79ms   22.30ms    8.50ms   52.68ms  host->
 mango-hybrid             22.80ms   21.50ms    1.30ms    2.09ms   28.31ms  file->VkImage
 mango-gpu               426.54ms  423.47ms    1.13ms    0.46ms  427.00ms  file->VkImage
 mango-gpu-index          25.27ms   22.42ms    0.90ms    0.51ms   25.78ms  file->VkImage
+mango-gpu2               TODO
 turbojpeg                27.93ms   24.55ms    3.38ms    0.50ms   28.43ms  host->VkImage
 apple-vt [hw]            11.94ms   11.85ms    0.09ms    1.84ms   13.80ms  file->VkImage
 apple-imageio            26.67ms   26.60ms    0.07ms    1.68ms   28.37ms  file->VkImage

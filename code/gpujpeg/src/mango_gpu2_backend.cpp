@@ -399,7 +399,8 @@ layout(local_size_x = WRITE_WG) in;
 
 // A block belongs to the piece its DC symbol starts in: a piece first skips
 // the rest of a block begun before it, and finishes its own last block past
-// its end. AC values go out two per word as they pass; the buffer is zeroed.
+// its end. AC values go out two per word in zigzag order, every word up to the
+// last nonzero one; word 0's low half (the DC slot) holds how many there are.
 void main()
 {
     loadTabs();
@@ -431,7 +432,8 @@ void main()
         uint base = uint(B) * 32u;
         int dcv = 0;
         uint pend = 0u;
-        int pq = -1;
+        uint w0 = 0u;
+        int pq = 0;
         do
         {
             uint bits = peek(r, pos);
@@ -451,12 +453,14 @@ void main()
                 else if (zi < 64)
                 {
                     int q = zi >> 1;
-                    if (q != pq)
+                    while (pq < q)
                     {
-                        if (pq >= 0)
+                        if (pq == 0)
+                            w0 = pend;
+                        else
                             coef[base + uint(pq)] = pend;
                         pend = 0u;
-                        pq = q;
+                        ++pq;
                     }
                     pend |= (uint(v) & 0xffffu) << (uint(zi & 1) * 16u);
                 }
@@ -464,8 +468,11 @@ void main()
             pos += uint(tot);
             z += za;
         } while (z < 64);
-        if (pq >= 0)
+        if (pq == 0)
+            w0 = pend;
+        else
             coef[base + uint(pq)] = pend;
+        coef[base] = (w0 & 0xffff0000u) | uint(pq + 1);
         dcd[B] = dcv;
         z = 0;
         bc = nextBlock(bc);
@@ -608,7 +615,9 @@ const int zigzag[64] = int[](
     53, 60, 61, 54, 47, 55, 62, 63
 );
 
-// 32 block slots. nat holds dezigzag'd coeffs, then the finished samples.
+// 32 block slots of 8 lanes. nat holds dezigzag'd coeffs, then the finished
+// samples. The frame layout (BPM, XB, YB, *_H, *_V, *_OFF, *_QT, NCOMP, MPG)
+// is compiled in so the per-pixel sampling math is shifts and constants.
 shared int nat[32 * 64];
 shared int tmp[32 * 64];
 
@@ -648,24 +657,28 @@ int clamp_u8(int v)
 
 int qt_index_of(int b)
 {
-    if (b >= pc.y_off && b < pc.y_off + pc.y_hsf * pc.y_vsf)
-        return pc.y_qt;
-    if (pc.components > 1 && b >= pc.cb_off && b < pc.cb_off + pc.cb_hsf * pc.cb_vsf)
-        return pc.cb_qt;
-    if (pc.components > 2 && b >= pc.cr_off && b < pc.cr_off + pc.cr_hsf * pc.cr_vsf)
-        return pc.cr_qt;
+    if (b >= Y_OFF && b < Y_OFF + Y_H * Y_V)
+        return Y_QT;
+#if NCOMP > 1
+    if (b >= CB_OFF && b < CB_OFF + CB_H * CB_V)
+        return CB_QT;
+#endif
+#if NCOMP > 2
+    if (b >= CR_OFF && b < CR_OFF + CR_H * CR_V)
+        return CR_QT;
+#endif
     return 0;
 }
 
 int sample_at(int mcu_local, int first_block, int hsf, int vsf, int lx, int ly)
 {
-    int block_w = max(pc.xblock / max(hsf, 1), 1);
-    int block_h = max(pc.yblock / max(vsf, 1), 1);
-    int bx = min(lx / block_w, hsf - 1);
-    int by = min(ly / block_h, vsf - 1);
-    int spx = clamp(((lx % block_w) * 8) / block_w, 0, 7);
-    int spy = clamp(((ly % block_h) * 8) / block_h, 0, 7);
-    int block = mcu_local * pc.bpm + first_block + by * hsf + bx;
+    int block_w = XB / hsf;
+    int block_h = YB / vsf;
+    int bx = lx / block_w;
+    int by = ly / block_h;
+    int spx = ((lx % block_w) * 8) / block_w;
+    int spy = ((ly % block_h) * 8) / block_h;
+    int block = mcu_local * BPM + first_block + by * hsf + bx;
     return nat[block * 64 + spy * 8 + spx];
 }
 
@@ -674,42 +687,46 @@ void main()
     int lane = int(gl_LocalInvocationIndex);
     int slot = lane >> 3;
     int col = lane & 7;
-    int group0 = int(gl_WorkGroupID.x) * pc.mcusPerGroup;
-    int used = pc.mcusPerGroup * pc.bpm;
+    int group0 = int(gl_WorkGroupID.x) * MPG;
+    const int used = MPG * BPM;
 
-    int mcu_local = 0;
-    int b = 0;
-    bool live = false;
-    if (slot < used)
-    {
-        mcu_local = slot / pc.bpm;
-        b = slot - mcu_local * pc.bpm;
-        live = (group0 + mcu_local) < pc.nmcu;
-    }
+    int mcu_local = slot / BPM;
+    int b = slot - mcu_local * BPM;
+    bool live = slot < used && (group0 + mcu_local) < pc.nmcu;
+    int dst = slot * 64;
+    int blk = (group0 + mcu_local) * BPM + b;
+    int qbase = qt_index_of(b) * 64;
 
+    // Lane col owns zigzag positions col*8 .. col*8+7, i.e. words col*4 .. col*4+3.
+    bool dcOnly = false;
     if (live)
     {
-        int blk = (group0 + mcu_local) * pc.bpm + b;
-        int dst = slot * 64;
-        for (int i = col; i < 64; i += 8)
+        uint w0 = coef[uint(blk) * 32u];
+        uint nw = w0 & 0xffffu;
+        int dc = dcd[blk];
+        dcOnly = nw == 1u && (w0 >> 16) == 0u;
+        if (dcOnly)
         {
-            int v;
-            if (i == 0)
-                v = dcd[blk];
-            else
+            int v = clamp_u8((((dc * qt[qbase]) << 2) * 4096 + 0x10000 + (128 << 17)) >> 17);
+            for (int k = 0; k < 8; ++k)
+                nat[dst + col * 8 + k] = v;
+        }
+        else
+        {
+            for (int k = 0; k < 4; ++k)
             {
-                uint w = coef[uint(blk) * 32u + uint(i >> 1)];
-                v = (i & 1) != 0 ? (int(w) >> 16) : (int(w << 16) >> 16);
+                uint wi = uint(col * 4 + k);
+                uint w = wi < nw ? coef[uint(blk) * 32u + wi] : 0u;
+                int i = int(wi) * 2;
+                nat[dst + zigzag[i]] = i == 0 ? dc : (int(w << 16) >> 16);
+                nat[dst + zigzag[i + 1]] = int(w) >> 16;
             }
-            nat[dst + zigzag[i]] = v;
         }
     }
     barrier();
 
-    if (live)
+    if (live && !dcOnly)
     {
-        int dst = slot * 64;
-        int qbase = qt_index_of(b) * 64;
         int n0 = nat[dst + col];
         int n1 = nat[dst + col + 8];
         int n2 = nat[dst + col + 16];
@@ -746,9 +763,8 @@ void main()
     }
     barrier();
 
-    if (live)
+    if (live && !dcOnly)
     {
-        int dst = slot * 64;
         int row = col;
         int x0, x1, x2, x3, y0, y1, y2, y3;
         idct_pass(x0, x1, x2, x3, y0, y1, y2, y3,
@@ -768,36 +784,32 @@ void main()
     }
     barrier();
 
-    int area = pc.xblock * pc.yblock;
-    int span = pc.mcusPerGroup * area;
-    for (int p = lane; p < span; p += 256)
+    const int area = XB * YB;
+    for (int p = lane; p < MPG * area; p += 256)
     {
         int mcu_i = p / area;
         int pix = p - mcu_i * area;
         int global_mcu = group0 + mcu_i;
         if (global_mcu >= pc.nmcu)
             continue;
-        int lx = pix % pc.xblock;
-        int ly = pix / pc.xblock;
-        int px = (global_mcu % pc.xmcu) * pc.xblock + lx;
-        int py = (global_mcu / pc.xmcu) * pc.yblock + ly;
+        int lx = pix % XB;
+        int ly = pix / XB;
+        int px = (global_mcu % pc.xmcu) * XB + lx;
+        int py = (global_mcu / pc.xmcu) * YB + ly;
         if (px >= pc.width || py >= pc.height)
             continue;
 
-        int Y = sample_at(mcu_i, pc.y_off, pc.y_hsf, pc.y_vsf, lx, ly);
+        int Y = sample_at(mcu_i, Y_OFF, Y_H, Y_V, lx, ly);
         int R, G, B;
-        if (pc.components == 1)
-        {
-            R = G = B = Y;
-        }
-        else
-        {
-            int Cb = sample_at(mcu_i, pc.cb_off, pc.cb_hsf, pc.cb_vsf, lx, ly) - 128;
-            int Cr = sample_at(mcu_i, pc.cr_off, pc.cr_hsf, pc.cr_vsf, lx, ly) - 128;
-            R = clamp_u8(Y + ((Cr * 91881) >> 16));
-            G = clamp_u8(Y - ((Cb * 22554 + Cr * 46802) >> 16));
-            B = clamp_u8(Y + ((Cb * 116130) >> 16));
-        }
+#if NCOMP == 1
+        R = G = B = Y;
+#else
+        int Cb = sample_at(mcu_i, CB_OFF, CB_H, CB_V, lx, ly) - 128;
+        int Cr = sample_at(mcu_i, CR_OFF, CR_H, CR_V, lx, ly) - 128;
+        R = clamp_u8(Y + ((Cr * 91881) >> 16));
+        G = clamp_u8(Y - ((Cb * 22554 + Cr * 46802) >> 16));
+        B = clamp_u8(Y + ((Cb * 116130) >> 16));
+#endif
 #ifdef LINEAR_OUT
         rgbaOut[py * pc.width + px] = uint(R) | (uint(G) << 8) | (uint(B) << 16) | 0xff000000u;
 #else
@@ -1158,6 +1170,48 @@ void MangoGpu2Decoder::release(mango::vulkan::Allocator& allocator)
     uploaded = false;
 }
 
+static void fillLayout(const mango::image::jpeg::JpegInfo& info, int bpm, Push& push)
+{
+    push.bpm = bpm;
+    push.width = info.width;
+    push.height = info.height;
+    push.xmcu = info.xmcu;
+    push.xblock = info.xblock;
+    push.yblock = info.yblock;
+    push.components = info.components;
+    int off = 0;
+    auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
+    {
+        if (idx >= info.components)
+        {
+            hsf = vsf = 1;
+            qt = 0;
+            o = 0;
+            return;
+        }
+        hsf = info.component[idx].hsf;
+        vsf = info.component[idx].vsf;
+        qt = info.component[idx].qt;
+        o = off;
+        off += hsf * vsf;
+    };
+    setComp(0, push.y_hsf, push.y_vsf, push.y_qt, push.y_off);
+    setComp(1, push.cb_hsf, push.cb_vsf, push.cb_qt, push.cb_off);
+    setComp(2, push.cr_hsf, push.cr_vsf, push.cr_qt, push.cr_off);
+    push.mcus_per_group = std::max(32 / std::max(push.bpm, 1), 1);
+    push.nmcu = info.xmcu * info.ymcu;
+}
+
+static std::string idctDefines(const Push& p)
+{
+    auto d = [](const char* name, int v) { return std::string("#define ") + name + " " + std::to_string(v) + "\n"; };
+    return d("BPM", p.bpm) + d("XB", p.xblock) + d("YB", p.yblock) + d("NCOMP", p.components)
+        + d("MPG", p.mcus_per_group)
+        + d("Y_H", p.y_hsf) + d("Y_V", p.y_vsf) + d("Y_OFF", p.y_off) + d("Y_QT", p.y_qt)
+        + d("CB_H", p.cb_hsf) + d("CB_V", p.cb_vsf) + d("CB_OFF", p.cb_off) + d("CB_QT", p.cb_qt)
+        + d("CR_H", p.cr_hsf) + d("CR_V", p.cr_vsf) + d("CR_OFF", p.cr_off) + d("CR_QT", p.cr_qt);
+}
+
 bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, DecodedTexture& texture,
     std::string& error)
 {
@@ -1167,6 +1221,11 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
         m_sync_wg = std::atoi(s);
     if (const char* s = std::getenv("GPU2_WRITE_WG"))
         m_write_wg = std::atoi(s);
+    Push layout = {};
+    {
+        mango::image::jpeg::JpegDecoder info_decoder(m_jpeg);
+        fillLayout(info_decoder.info(), stream.blocks_in_mcu, layout);
+    }
     const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n";
     mango::vulkan::Compiler compiler;
     const std::string sources[PipeCount] = {
@@ -1175,7 +1234,7 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
         std::string(kCommon) + defs + "#define WRITE_WG " + std::to_string(m_write_wg) + "\n" + kHuffman + kWriteMain,
         std::string(kCommon) + kDcScan + kDcLocalMain,
         std::string(kCommon) + kDcScan + kDcGroupsMain,
-        std::string(kCommon) + (m_linear ? "#define LINEAR_OUT 1\n" : "") + kIdctMain,
+        std::string(kCommon) + idctDefines(layout) + (m_linear ? "#define LINEAR_OUT 1\n" : "") + kIdctMain,
     };
     for (int i = 0; i < PipeCount; ++i)
     {
@@ -1382,38 +1441,11 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
     Push push = {};
     push.nch = chunks;
     push.rounds = m_sync_wg;
-    push.bpm = stream.blocks_in_mcu;
     push.dc_pack = m_dc_pack;
     push.ac_pack = m_ac_pack;
     push.comp_pack = m_comp_pack;
     push.nwords = m_nwords;
-    push.width = info.width;
-    push.height = info.height;
-    push.xmcu = info.xmcu;
-    push.xblock = info.xblock;
-    push.yblock = info.yblock;
-    push.components = info.components;
-    int off = 0;
-    auto setComp = [&](int idx, std::int32_t& hsf, std::int32_t& vsf, std::int32_t& qt, std::int32_t& o)
-    {
-        if (idx >= info.components)
-        {
-            hsf = vsf = 1;
-            qt = 0;
-            o = 0;
-            return;
-        }
-        hsf = info.component[idx].hsf;
-        vsf = info.component[idx].vsf;
-        qt = info.component[idx].qt;
-        o = off;
-        off += hsf * vsf;
-    };
-    setComp(0, push.y_hsf, push.y_vsf, push.y_qt, push.y_off);
-    setComp(1, push.cb_hsf, push.cb_vsf, push.cb_qt, push.cb_off);
-    setComp(2, push.cr_hsf, push.cr_vsf, push.cr_qt, push.cr_off);
-    push.mcus_per_group = std::max(32 / std::max(push.bpm, 1), 1);
-    push.nmcu = info.xmcu * info.ymcu;
+    fillLayout(info, stream.blocks_in_mcu, push);
 
     VkCommandBuffer cmd = m_cmd;
     vkResetCommandBuffer(cmd, 0);
@@ -1445,7 +1477,6 @@ bool MangoGpu2Decoder::decode(mango::vulkan::VulkanWindow& window,
         copy(m_seg_start_host, m_seg_start, VkDeviceSize(m_seg_start_words) * 4);
         m_static_copied = true;
     }
-    vkCmdFillBuffer(cmd, m_coef.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_dcd.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(cmd, m_flags.buffer, 0, VK_WHOLE_SIZE, 0);
     memBarrier(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
