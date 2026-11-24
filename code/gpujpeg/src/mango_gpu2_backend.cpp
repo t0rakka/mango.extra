@@ -126,7 +126,7 @@ shared uint shv[NT * 64];
 void loadTabs()
 {
     uint t = gl_LocalInvocationIndex;
-    uint n = gl_WorkGroupSize.x;
+    uint n = uint(HUFF_WG);
     for (uint i = t; i < uint(NT * 512); i += n)
         slut[i] = tlut[i];
     for (uint i = t; i < uint(NT * 18); i += n)
@@ -1228,10 +1228,14 @@ bool MangoGpu2Decoder::createPipelines(mango::vulkan::VulkanWindow& window, Deco
     }
     const std::string defs = "#define NT " + std::to_string(std::max(m_ntables, 1)) + "\n";
     mango::vulkan::Compiler compiler;
+    // The shared Huffman code sits before each main's local_size declaration,
+    // so it reads the workgroup width from HUFF_WG.
+    const std::string sync_wg = std::to_string(m_sync_wg);
+    const std::string write_wg = std::to_string(m_write_wg);
     const std::string sources[PipeCount] = {
-        std::string(kCommon) + defs + "#define SYNC_WG " + std::to_string(m_sync_wg) + "\n" + kHuffman + kSyncMain,
+        std::string(kCommon) + defs + "#define SYNC_WG " + sync_wg + "\n#define HUFF_WG " + sync_wg + "\n" + kHuffman + kSyncMain,
         std::string(kCommon) + kPrefixMain,
-        std::string(kCommon) + defs + "#define WRITE_WG " + std::to_string(m_write_wg) + "\n" + kHuffman + kWriteMain,
+        std::string(kCommon) + defs + "#define WRITE_WG " + write_wg + "\n#define HUFF_WG " + write_wg + "\n" + kHuffman + kWriteMain,
         std::string(kCommon) + kDcScan + kDcLocalMain,
         std::string(kCommon) + kDcScan + kDcGroupsMain,
         std::string(kCommon) + idctDefines(layout) + (m_linear ? "#define LINEAR_OUT 1\n" : "") + kIdctMain,

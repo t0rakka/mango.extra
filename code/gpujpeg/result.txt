@@ -176,7 +176,7 @@ mango                    25.65ms    3.34ms   21.22ms    8.55ms   34.21ms  host->
 mango-hybrid             13.57ms    2.55ms   11.02ms    1.62ms   18.63ms  file->VkImage
 mango-gpu                 9.50ms    5.63ms    1.83ms    0.55ms   10.05ms  file->VkImage
 mango-gpu-index          12.17ms    8.52ms    7.33ms    0.50ms   12.67ms  file->VkImage
-mango-gpu2               TODO
+mango-gpu2                2.61ms    1.14ms    0.00ms    5.71ms    8.31ms  file->VkImage
 turbojpeg                30.27ms   26.72ms    3.54ms    1.20ms   31.47ms  host->VkImage
 apple-vt [hw]            11.91ms   11.83ms    0.08ms    1.03ms   12.96ms  file->VkImage
 apple-imageio            26.27ms   26.18ms    0.09ms    1.31ms   27.61ms  file->VkImage
@@ -188,7 +188,7 @@ mango                    44.18ms   20.79ms   22.30ms    8.50ms   52.68ms  host->
 mango-hybrid             22.80ms   21.50ms    1.30ms    2.09ms   28.31ms  file->VkImage
 mango-gpu               426.54ms  423.47ms    1.13ms    0.46ms  427.00ms  file->VkImage
 mango-gpu-index          25.27ms   22.42ms    0.90ms    0.51ms   25.78ms  file->VkImage
-mango-gpu2               TODO
+mango-gpu2                2.36ms    0.93ms    0.00ms    5.93ms    8.30ms  file->VkImage
 turbojpeg                27.93ms   24.55ms    3.38ms    0.50ms   28.43ms  host->VkImage
 apple-vt [hw]            11.94ms   11.85ms    0.09ms    1.84ms   13.80ms  file->VkImage
 apple-imageio            26.67ms   26.60ms    0.07ms    1.68ms   28.37ms  file->VkImage
