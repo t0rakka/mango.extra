@@ -6,6 +6,7 @@
 #include "decoded_texture.hpp"
 #include "mango_gpu_backend.hpp"
 #include "mango_gpu2_backend.hpp"
+#include "mango_cuda_backend.hpp"
 #include "mango_hybrid_backend.hpp"
 #include "mango_hybrid_compute.hpp"
 #include "nvjpeg_backend.hpp"
@@ -49,6 +50,7 @@ enum class Backend
     Hybrid,  // mango Spectral Huffman + VK compute
     Gpu,     // mango-gpu: Mango1 entropy -> VkBuffer (Huffman compute later)
     Gpu2,    // mango-gpu2: wide self-sync Huffman + IDCT
+    Cuda,    // mango-cuda: the same decode as CUDA kernels
     NvJpeg,
     Roc,
     IntelVpl, // QSV JPEG → host → VkImage (curiosity)
@@ -96,9 +98,9 @@ void configureParser(const CommandLine& commands, Args& args)
     commands.usage("[options] <file.jpg>");
 
     commands.option("--backend",
-        "mango | hybrid | gpu | gpu2 | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
+        "mango | hybrid | gpu | gpu2 | cuda | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
         "         hybrid = Huffman+VK compute; gpu = self-sync, then mango-gpu-index;\n"
-        "         gpu2 = wide chunk self-sync Huffman + IDCT;\n"
+        "         gpu2 = wide chunk self-sync Huffman + IDCT; cuda = that decode in CUDA;\n"
         "         roc = VCN JPEG; intel = QSV JPEG (igpu→host→VkImage, curiosity);\n"
         "         wic = Windows Imaging Component JPEG → host RGBA → VkImage;\n"
         "         turbojpeg = libjpeg-turbo (host RGBA → VkImage);\n"
@@ -115,6 +117,8 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::Gpu;
             else if (value == "gpu2" || value == "mango-gpu2")
                 args.backend = Backend::Gpu2;
+            else if (value == "cuda" || value == "mango-cuda")
+                args.backend = Backend::Cuda;
             else if (value == "nvjpeg")
                 args.backend = Backend::NvJpeg;
             else if (value == "roc")
@@ -135,7 +139,7 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::All;
             else
                 args.error = fmt::format(
-                    "Invalid --backend \"{}\" (mango|hybrid|gpu|gpu2|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
+                    "Invalid --backend \"{}\" (mango|hybrid|gpu|gpu2|cuda|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
         });
 
     commands.option("--nvjpeg-mode", "hybrid | gpu | hardware | both (default both). "
@@ -421,6 +425,7 @@ struct Job
     bool use_hybrid = false;
     bool use_gpu = false;
     bool use_gpu2 = false;
+    bool use_cuda = false;
     bool use_roc = false;
     bool use_intel_vpl = false;
     bool use_wic = false;
@@ -437,6 +442,7 @@ struct Job
     TurboJpegDecoder* turbo = nullptr;
     MangoGpuDecoder* gpu = nullptr;
     MangoGpu2Decoder* gpu2 = nullptr;
+    MangoCudaDecoder* cuda = nullptr;
 };
 
 struct BackendSlot
@@ -613,7 +619,7 @@ public:
                 printLine("DecodedTexture [{}]: skipped (huffman-only floor)", jobs[i].name);
                 continue;
             }
-            const bool cuda_export = want_cuda_texture && jobs[i].use_nvjpeg;
+            const bool cuda_export = want_cuda_texture && (jobs[i].use_nvjpeg || jobs[i].use_cuda);
             const bool hip_export = want_hip_texture && jobs[i].use_roc && jobs[i].roc && jobs[i].roc->ok;
             if (!slots[i].texture.create(*this, *allocator, content_w, content_h,
                     cuda_export, error, hip_export))
@@ -1360,6 +1366,70 @@ public:
             slot.ready = true;
             setTitle(fmt::format("gpujpeg [{}] READY {:.2f} ms", job.name, r.ready_us / 1000.0));
             return r;
+        }
+
+        if (job.use_cuda)
+        {
+#if defined(GPUJPEG_HAS_MANGO_CUDA)
+            if (!job.cuda)
+            {
+                r.error = "mango-cuda decoder missing";
+                return r;
+            }
+            if (!texture.cuda_ready || !texture.cuda_rgba)
+            {
+                r.error = "CUDA-Vulkan export buffer not available";
+                return r;
+            }
+            if (!job.cuda->decode(texture.cuda_rgba, error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.device_only = true;
+            r.image.width = job.cuda->stream.width;
+            r.image.height = job.cuda->stream.height;
+            r.decode_us = job.cuda->decode_us;
+            printLine("  cuda: huffman {:.2f} ms, pixels {:.2f} ms, {} chunks x {} bits",
+                job.cuda->huffman_us / 1000.0,
+                job.cuda->pixel_us / 1000.0,
+                job.cuda->chunks,
+                2048);
+            const u64 t_prom0 = nowUs();
+            if (!texture.flushCopyCudaToImage(graphicsQueue(), graphicsQueueFamilyIndex(), error))
+            {
+                r.error = error;
+                return r;
+            }
+            r.promote_us = nowUs() - t_prom0;
+            mango::u64 wall = nowUs() - t0;
+            r.ready_us = wall;
+            addMilestone(r.milestones, "vk_ready", t0);
+            if (std::getenv("GPUJPEG_CHECK"))
+            {
+                const int delta = checkHybridImage(texture, jpeg,
+                    graphicsQueue(), graphicsQueueFamilyIndex(), error);
+                if (delta < 0)
+                    printLine("  cuda check FAILED: {}", error);
+                else
+                    printLine("  cuda check: max |gpu-cpu| = {}", delta);
+            }
+            const u64 t_pr0 = nowUs();
+            if (!presentSlotFullscreen(texture))
+            {
+                r.error = "present blit failed";
+                return r;
+            }
+            r.present_us = nowUs() - t_pr0;
+            r.e2e_us = r.ready_us + r.present_us;
+            r.ok = true;
+            slot.ready = true;
+            setTitle(fmt::format("gpujpeg [{}] READY {:.2f} ms", job.name, r.ready_us / 1000.0));
+            return r;
+#else
+            r.error = "mango-cuda not built";
+            return r;
+#endif
         }
 
         if (job.use_hybrid)
@@ -2179,6 +2249,9 @@ int main(int argc, const char* argv[])
     const bool want_gpu2 =
         args.backend == Backend::Gpu2 ||
         args.backend == Backend::All;
+    const bool want_cuda =
+        args.backend == Backend::Cuda ||
+        args.backend == Backend::All;
     std::vector<std::unique_ptr<MangoGpuDecoder>> gpu_decoders;
     if (want_gpu)
     {
@@ -2253,6 +2326,39 @@ int main(int argc, const char* argv[])
             jobs.push_back(std::move(job));
             gpu2_decoders.push_back(std::move(gpu2));
         }
+    }
+
+    std::vector<std::unique_ptr<MangoCudaDecoder>> cuda_decoders;
+    if (want_cuda)
+    {
+#if defined(GPUJPEG_HAS_MANGO_CUDA)
+        auto cudaDec = std::make_unique<MangoCudaDecoder>();
+        std::string error;
+        if (!cudaDec->extract(jpeg, error))
+        {
+            printLine("mango-cuda extract FAILED: {}", error);
+            if (args.backend == Backend::Cuda)
+                return 1;
+        }
+        else
+        {
+            printLine("mango-cuda: {} segments, {} chunks, {}x{} MCU, extract {:.2f} ms",
+                cudaDec->stream.segments.size(),
+                cudaDec->chunks,
+                cudaDec->stream.xmcu, cudaDec->stream.ymcu,
+                cudaDec->extract_us / 1000.0);
+            Job job;
+            job.name = "mango-cuda";
+            job.use_cuda = true;
+            job.cuda = cudaDec.get();
+            jobs.push_back(std::move(job));
+            cuda_decoders.push_back(std::move(cudaDec));
+        }
+#else
+        printLine("mango-cuda requested but CUDA was not found.");
+        if (args.backend == Backend::Cuda)
+            return 1;
+#endif
     }
 
     auto addNv = [&](NvJpegMode mode)
@@ -2628,7 +2734,7 @@ int main(int argc, const char* argv[])
     const int win_w = cell_w * cols;
     const int win_h = cell_h * rows;
 
-    const bool cuda_export = want_nv && nvjpegAvailable();
+    const bool cuda_export = (want_nv && nvjpegAvailable()) || (want_cuda && !cuda_decoders.empty());
     const bool hip_export = want_roc && rocAvailable();
     VulkanDeviceConfig deviceConfig;
     const VulkanDeviceConfig* windowConfig = nullptr;
@@ -2728,6 +2834,8 @@ int main(int argc, const char* argv[])
             gpu->release(*window.allocator);
         for (auto& gpu2 : gpu2_decoders)
             gpu2->release(*window.allocator);
+        for (auto& cudaDec : cuda_decoders)
+            cudaDec->release();
     }
 
     printLine("==================================================");
