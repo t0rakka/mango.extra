@@ -4,7 +4,6 @@
 #include "backends.hpp"
 #include "bench.hpp"
 #include "decoded_texture.hpp"
-#include "mango_gpu_backend.hpp"
 #include "mango_gpu2_backend.hpp"
 #include "mango_hybrid_backend.hpp"
 #include "mango_hybrid_compute.hpp"
@@ -47,8 +46,7 @@ enum class Backend
 {
     Mango,
     Hybrid,  // mango Spectral Huffman + VK compute
-    Gpu,     // mango-gpu: Mango1 entropy -> VkBuffer (Huffman compute later)
-    Gpu2,    // mango-gpu2: wide self-sync Huffman + IDCT
+    Gpu2,    // mango-gpu2: wide chunk self-sync Huffman + IDCT
     NvJpeg,
     Roc,
     IntelVpl, // QSV JPEG → host → VkImage (curiosity)
@@ -97,8 +95,8 @@ void configureParser(const CommandLine& commands, Args& args)
     commands.usage("[options] <file.jpg>");
 
     commands.option("--backend",
-        "mango | hybrid | gpu | gpu2 | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
-        "         hybrid = Huffman+VK compute; gpu = self-sync, then mango-gpu-index;\n"
+        "mango | hybrid | gpu2 | nvjpeg | roc | intel | wic | turbojpeg | apple-vt | apple-imageio | both | all (default all)\n"
+        "         hybrid = Huffman+VK compute;\n"
         "         gpu2 = wide chunk self-sync Huffman + IDCT;\n"
         "         roc = VCN JPEG; intel = QSV JPEG (igpu→host→VkImage, curiosity);\n"
         "         wic = Windows Imaging Component JPEG → host RGBA → VkImage;\n"
@@ -112,9 +110,7 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::Mango;
             else if (value == "hybrid")
                 args.backend = Backend::Hybrid;
-            else if (value == "gpu" || value == "mango-gpu")
-                args.backend = Backend::Gpu;
-            else if (value == "gpu2" || value == "mango-gpu2")
+            else if (value == "gpu2" || value == "mango-gpu2" || value == "gpu")
                 args.backend = Backend::Gpu2;
             else if (value == "nvjpeg")
                 args.backend = Backend::NvJpeg;
@@ -136,7 +132,7 @@ void configureParser(const CommandLine& commands, Args& args)
                 args.backend = Backend::All;
             else
                 args.error = fmt::format(
-                    "Invalid --backend \"{}\" (mango|hybrid|gpu|gpu2|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
+                    "Invalid --backend \"{}\" (mango|hybrid|gpu2|nvjpeg|roc|intel|wic|turbojpeg|apple-vt|apple-imageio|both|all)", value);
         });
 
     commands.option("--nvjpeg-mode", "hybrid | gpu | hardware | both (default both). "
@@ -196,10 +192,6 @@ void configureParser(const CommandLine& commands, Args& args)
 
     commands.flag("--hybrid-floor", "hybrid: Huffman only (no VK compute) — measure floor",
         [&]() { args.hybrid_floor = true; });
-
-    commands.flag("--gpu-index",
-        "legacy no-op; mango-gpu-index always runs immediately after mango-gpu",
-        [&]() {});
 
     commands.positional([&](std::string_view token) { args.filename = token; });
 }
@@ -423,7 +415,6 @@ struct Job
     std::string name;
     bool use_nvjpeg = false;
     bool use_hybrid = false;
-    bool use_gpu = false;
     bool use_gpu2 = false;
     bool use_roc = false;
     bool use_intel_vpl = false;
@@ -439,7 +430,6 @@ struct Job
     IntelVplDecoder* intel = nullptr;
     WicDecoder* wic = nullptr;
     TurboJpegDecoder* turbo = nullptr;
-    MangoGpuDecoder* gpu = nullptr;
     MangoGpu2Decoder* gpu2 = nullptr;
 };
 
@@ -1220,90 +1210,6 @@ public:
         DecodedTexture& texture = slot.texture;
         std::string error;
 
-        if (job.use_gpu)
-        {
-            if (!job.gpu)
-            {
-                r.error = "mango-gpu decoder missing";
-                return r;
-            }
-            if (!texture.image)
-            {
-                r.error = "DecodedTexture missing for mango-gpu";
-                return r;
-            }
-            if (!job.gpu->upload(*allocator, error))
-            {
-                r.error = error;
-                return r;
-            }
-            if (!job.gpu->decodeBlocks(*this, *allocator, texture, error))
-            {
-                r.error = error;
-                return r;
-            }
-
-            r.device_only = true;
-            r.image.width = job.gpu->stream.width;
-            r.image.height = job.gpu->stream.height;
-            r.decode_us = job.gpu->index_mode
-                ? job.gpu->index_us + job.gpu->huffman_us
-                : job.gpu->huffman_us;
-            r.promote_us = job.gpu->resolve_us;
-            mango::u64 wall = nowUs() - t0;
-            if (job.gpu->compile_last_us > 0 && wall > job.gpu->compile_last_us)
-                wall -= job.gpu->compile_last_us;
-            r.ready_us = wall;
-            addMilestone(r.milestones, "vk_ready", t0);
-            if (job.gpu->index_mode)
-            {
-                printLine("  gpu: index {:.2f} ms ({} MCUs, {} batches), xfer wait {:.2f} ms, upload stall {:.2f} ms, gpu tail {:.2f} ms{}",
-                    job.gpu->index_us / 1000.0,
-                    job.gpu->index_mcus,
-                    job.gpu->index_batches,
-                    job.gpu->xfer_wait_us / 1000.0,
-                    job.gpu->huffman_us / 1000.0,
-                    job.gpu->resolve_us / 1000.0,
-                    job.gpu->compile_last_us
-                        ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
-                        : "");
-            }
-            else
-            {
-                printLine("  gpu: huffman {:.2f} ms, idct {:.2f} ms, sync rounds {} chunk {} B{}",
-                    job.gpu->huffman_us / 1000.0,
-                    job.gpu->resolve_us / 1000.0,
-                    job.gpu->sync_rounds,
-                    job.gpu->sync_chunks,
-                    job.gpu->compile_last_us
-                        ? fmt::format("  (shader compile {:.2f} ms)", job.gpu->compile_last_us / 1000.0)
-                        : "");
-            }
-
-            if (std::getenv("GPUJPEG_CHECK"))
-            {
-                const int delta = checkHybridImage(texture, jpeg,
-                    graphicsQueue(), graphicsQueueFamilyIndex(), error);
-                if (delta < 0)
-                    printLine("  gpu check FAILED: {}", error);
-                else
-                    printLine("  gpu check: max |gpu-cpu| = {}", delta);
-            }
-
-            const u64 t_pr0 = nowUs();
-            if (!presentSlotFullscreen(texture))
-            {
-                r.error = "present blit failed";
-                return r;
-            }
-            r.present_us = nowUs() - t_pr0;
-            r.e2e_us = r.ready_us + r.present_us;
-            r.ok = true;
-            slot.ready = true;
-            setTitle(fmt::format("gpujpeg [{}] READY {:.2f} ms", job.name, r.ready_us / 1000.0));
-            return r;
-        }
-
         if (job.use_gpu2)
         {
             if (!job.gpu2)
@@ -2000,32 +1906,6 @@ bool probeSize(ConstMemory jpeg, int& width, int& height, std::string& error)
     return true;
 }
 
-// Vulkan 1.2 VkPhysicalDeviceDriverProperties. RADV is VK_DRIVER_ID_MESA_RADV.
-// AMDVLK and the Windows AMD driver use different driver IDs.
-bool physicalDeviceIsRadv(VkPhysicalDevice device, std::string& driver_info)
-{
-    driver_info.clear();
-    if (!device)
-        return false;
-
-    VkPhysicalDeviceDriverProperties driver
-    {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
-    };
-    VkPhysicalDeviceProperties2 props
-    {
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &driver,
-    };
-    vkGetPhysicalDeviceProperties2(device, &props);
-    if (driver.driverID != VK_DRIVER_ID_MESA_RADV)
-        return false;
-    driver_info = driver.driverInfo;
-    if (driver_info.empty())
-        driver_info = driver.driverName;
-    return true;
-}
-
 } // namespace
 
 int main(int argc, const char* argv[])
@@ -2199,62 +2079,9 @@ int main(int argc, const char* argv[])
 #endif
     }
 
-    const bool want_gpu =
-        args.backend == Backend::Gpu ||
-        args.backend == Backend::All;
     const bool want_gpu2 =
         args.backend == Backend::Gpu2 ||
         args.backend == Backend::All;
-    std::vector<std::unique_ptr<MangoGpuDecoder>> gpu_decoders;
-    if (want_gpu)
-    {
-        auto add_gpu = [&](bool index_mode) -> bool
-        {
-            auto gpu = std::make_unique<MangoGpuDecoder>();
-            gpu->index_mode = index_mode;
-            std::string error;
-            if (!gpu->extract(jpeg, error))
-            {
-                printLine("mango-gpu extract FAILED: {}", error);
-                return false;
-            }
-            if (!index_mode)
-            {
-                const jpeg::EntropyStream& s = gpu->stream;
-                const int mcus = s.segments.empty() ? 0 : s.segments.front().mcus;
-                printLine("mango-gpu: {} segments x {} MCU rows, packed {:.1f} KB (file {:.1f} KB), {}x{} MCU, block {}x{}, tables={}",
-                    s.segments.size(),
-                    s.rows_per_segment,
-                    s.packed_bytes / 1024.0,
-                    jpeg.size / 1024.0,
-                    s.xmcu, s.ymcu,
-                    s.xblock, s.yblock,
-                    s.huffman.size());
-                printLine("mango-gpu: extract {:.2f} ms  ({} MCUs, {} blocks/MCU)",
-                    gpu->extract_us / 1000.0, mcus, s.blocks_in_mcu);
-                std::fflush(stdout);
-            }
-
-            Job job;
-            job.name = index_mode ? "mango-gpu-index" : "mango-gpu";
-            job.use_gpu = true;
-            job.gpu = gpu.get();
-            jobs.push_back(std::move(job));
-            gpu_decoders.push_back(std::move(gpu));
-            return true;
-        };
-        // Self-sync first, then the CPU-indexed MCU pass, so one scoreboard shows both.
-        if (!add_gpu(false))
-        {
-            if (args.backend == Backend::Gpu)
-                return 1;
-        }
-        else if (!add_gpu(true) && args.backend == Backend::Gpu)
-        {
-            return 1;
-        }
-    }
-
     std::vector<std::unique_ptr<MangoGpu2Decoder>> gpu2_decoders;
     if (want_gpu2)
     {
@@ -2612,41 +2439,7 @@ int main(int argc, const char* argv[])
     Instance instance(appInfo, layers, extensions);
     VulkanContext ctx(instance);
 
-    // Chosen before the window so a skipped mango-gpu cell is not laid out.
     const VkPhysicalDevice selected_device = selectPhysicalDevice(instance);
-    std::string radv_info;
-    std::string radv_gpu_note;
-    if (physicalDeviceIsRadv(selected_device, radv_info))
-    {
-        // The original self-sync path hands the cursor through shared memory.
-        // RADV miscompiles that, so those lanes never agree. mango-gpu2 is a
-        // separate path and stays enabled on RADV.
-        const auto is_self_sync = [](const Job& job)
-        {
-            return job.use_gpu && job.gpu && !job.gpu->index_mode;
-        };
-        if (std::any_of(jobs.begin(), jobs.end(), is_self_sync))
-        {
-            radv_gpu_note = "NOTE: blacklisted (RADV driver shared memory bug: sync failure)";
-            printLine("mango-gpu: {} ({})", radv_gpu_note, radv_info);
-            std::erase_if(jobs, is_self_sync);
-        }
-    }
-    if (jobs.empty())
-    {
-        if (radv_gpu_note.empty())
-        {
-            printLine("No backends to run.");
-            return 1;
-        }
-        printLine("==================================================");
-        printLine("Primary metric: READY = start -> VkImage usable");
-        printLine("{:<22} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
-            "backend", "READY", "decode", "promote", "present", "e2e", "path");
-        printLine("");
-        printLine("{:<22} {}", "mango-gpu", radv_gpu_note);
-        return 0;
-    }
 
     int cell_w = 0;
     int cell_h = 0;
@@ -2754,8 +2547,6 @@ int main(int argc, const char* argv[])
 
     if (window.allocator)
     {
-        for (auto& gpu : gpu_decoders)
-            gpu->release(*window.allocator);
         for (auto& gpu2 : gpu2_decoders)
             gpu2->release(*window.allocator);
     }
@@ -2767,20 +2558,10 @@ int main(int argc, const char* argv[])
     printLine("{:<22} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
         "backend", "READY", "decode", "promote", "present", "e2e", "path");
     printLine("");
-    bool radv_note_printed = false;
-    auto printRadvGpuNote = [&]()
-    {
-        if (radv_note_printed || radv_gpu_note.empty())
-            return;
-        radv_note_printed = true;
-        printLine("{:<22} {}", "mango-gpu", radv_gpu_note);
-    };
     for (const auto& r : window.results)
     {
         if (!r.ok)
             continue;
-        if (r.backend.starts_with("mango-gpu-index"))
-            printRadvGpuNote();
         if (r.pipeline_count > 0)
         {
             printLine("{:<22} {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms {:>7.2f}ms  {}",
@@ -2802,7 +2583,5 @@ int main(int argc, const char* argv[])
             r.e2e_us / 1000.0,
             path);
     }
-    printRadvGpuNote();
-
     return 0;
 }

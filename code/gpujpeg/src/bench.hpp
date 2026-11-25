@@ -42,7 +42,7 @@ struct PipelineResult
     int pipeline_count = 0;
     bool pipeline_overlapped = false;
     bool device_only = false;
-    bool bitstream_upload = false; // mango-gpu: packed entropy in a VkBuffer, no pixels yet
+    bool bitstream_upload = false; // reserved; was mango-gpu packed-entropy path
     bool igpu_host = false;        // Intel QSV: igpu→host→VkImage (not on-device)
     bool ok = false;
     std::string error;
