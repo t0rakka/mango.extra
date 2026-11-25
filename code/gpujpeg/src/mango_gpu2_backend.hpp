@@ -1,5 +1,7 @@
-// Copyright 2026 Distance Technologies Oy. For internal use only.
-//
+/*
+    MANGO Multimedia Development Platform
+    Copyright (C) 2012-2026 Twilight Finland 3D Oy Ltd. All rights reserved.
+*/
 #pragma once
 
 #include "bench.hpp"
